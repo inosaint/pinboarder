@@ -1,5 +1,7 @@
 # Pinboarder
 
+![Pinboarder v 0.1.0](public/v0.1.0.png)
+
 A retro-modern themed macOS menubar app for [Pinboard](https://pinboard.in). 
 
 ## Features
@@ -27,7 +29,7 @@ npm run tauri dev
 
 ## Tech
 
-- Designed using Variant.com
+- Designed using [Variant.com](https://variant.com/)
 - Coded by Codex and Claude Code
 - [Tauri v2](https://tauri.app) + React 19 + TypeScript
 - SQLite (via `rusqlite`) for local bookmark cache
