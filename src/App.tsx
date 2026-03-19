@@ -2,6 +2,8 @@ import { FormEvent, useEffect, useMemo, useRef, useState, useCallback } from "re
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { appLocalDataDir, join } from "@tauri-apps/api/path";
+import { Stronghold } from "@tauri-apps/plugin-stronghold";
 import "./App.css";
 
 type Bookmark = {
@@ -28,28 +30,78 @@ type OpenUrlEvent = { url: string };
 
 const STRONGHOLD_CLIENT_NAME = "pinboarder";
 const STRONGHOLD_TOKEN_KEY = "pinboard_api_token";
-const LOCAL_TOKEN_KEY = `${STRONGHOLD_CLIENT_NAME}:${STRONGHOLD_TOKEN_KEY}`;
+const STRONGHOLD_PASSWORD = "pinboarder-vault-v1";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _storePromise: Promise<{ stronghold: Stronghold; store: any }> | null = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getStore(): Promise<{ stronghold: Stronghold; store: any }> {
+  if (!_storePromise) {
+    console.log("[pinboarder-stronghold] getStore: initializing vault (argon2 will run once)");
+    _storePromise = (async () => {
+      const vaultPath = await join(await appLocalDataDir(), "pinboarder.vault.hold");
+      console.log("[pinboarder-stronghold] vault path:", vaultPath);
+      const stronghold = await Stronghold.load(vaultPath, STRONGHOLD_PASSWORD);
+      console.log("[pinboarder-stronghold] Stronghold.load completed");
+      let client;
+      try {
+        client = await stronghold.loadClient(STRONGHOLD_CLIENT_NAME);
+        console.log("[pinboarder-stronghold] loadClient succeeded");
+      } catch {
+        console.log("[pinboarder-stronghold] loadClient failed, creating new client");
+        client = await stronghold.createClient(STRONGHOLD_CLIENT_NAME);
+        console.log("[pinboarder-stronghold] createClient succeeded");
+      }
+      return { stronghold, store: client.getStore() };
+    })();
+    _storePromise.catch((err) => {
+      console.error("[pinboarder-stronghold] vault init failed:", err);
+      _storePromise = null; // allow retry on next call
+    });
+  } else {
+    console.log("[pinboarder-stronghold] getStore: reusing cached vault");
+  }
+  return _storePromise;
+}
 
 async function readStoredToken(): Promise<string | null> {
   try {
-    // Stronghold intentionally disabled for now; use local persisted token copy.
-    const token = window.localStorage.getItem(LOCAL_TOKEN_KEY);
-    return token?.trim() || null;
-  } catch {
-    return null;
+    console.log("[pinboarder-stronghold] readStoredToken start");
+    const { store } = await getStore();
+    const raw = await store.get(STRONGHOLD_TOKEN_KEY);
+    const token = raw ? new TextDecoder().decode(new Uint8Array(raw)).trim() : null;
+    console.log("[pinboarder-stronghold] readStoredToken result:", token ? "found" : "not found");
+    if (token) return token;
+  } catch (err) {
+    console.error("[pinboarder-stronghold] readStoredToken error (trying fallback):", err);
   }
+  // Fallback: check localStorage (used when Stronghold fails)
+  const fallback = window.localStorage.getItem("pinboarder_token_fallback");
+  if (fallback) console.log("[pinboarder-stronghold] readStoredToken: using localStorage fallback");
+  return fallback?.trim() || null;
 }
 
 async function writeStoredToken(token: string): Promise<void> {
-  // Stronghold intentionally disabled for now; use local persisted token copy.
-  window.localStorage.setItem(LOCAL_TOKEN_KEY, token);
+  console.log("[pinboarder-stronghold] writeStoredToken start");
+  const { stronghold, store } = await getStore();
+  await store.insert(STRONGHOLD_TOKEN_KEY, Array.from(new TextEncoder().encode(token)));
+  await stronghold.save();
+  window.localStorage.removeItem("pinboarder_token_fallback"); // clear fallback once Stronghold succeeds
+  console.log("[pinboarder-stronghold] writeStoredToken saved");
 }
 
 async function clearStoredToken(): Promise<void> {
+  window.localStorage.removeItem("pinboarder_token_fallback");
+  // Do NOT reset _storePromise — vault stays open, we just remove the key
   try {
-    window.localStorage.removeItem(LOCAL_TOKEN_KEY);
-  } catch {
-    // ignore cleanup failures, app state is still cleared
+    console.log("[pinboarder-stronghold] clearStoredToken start");
+    const { stronghold, store } = await getStore();
+    await store.remove(STRONGHOLD_TOKEN_KEY);
+    await stronghold.save();
+    console.log("[pinboarder-stronghold] clearStoredToken saved");
+  } catch (err) {
+    console.error("[pinboarder-stronghold] clearStoredToken error (ignored):", err);
   }
 }
 
@@ -102,18 +154,30 @@ function syncLog(message: string, extra?: unknown) {
   console.log(`[pinboarder-sync-ui] ${message}`);
 }
 
+function LoadingDots() {
+  return (
+    <span className="loading-dots" aria-hidden="true">
+      <span className="loading-dot" />
+      <span className="loading-dot" />
+      <span className="loading-dot" />
+    </span>
+  );
+}
+
 function BookmarkRow({
   bookmark,
   onDelete,
   onEdit,
+  animationDelay,
 }: {
   bookmark: Bookmark;
   onDelete: (href: string) => Promise<void>;
   onEdit: (bookmark: Bookmark) => void;
+  animationDelay?: number;
 }) {
   const [deleting, setDeleting] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [menuPos, setMenuPos] = useState<{ top?: number; bottom?: number; right: number } | null>(null);
+  const [menuPos, setMenuPos] = useState<{ bottom: number; right: number } | null>(null);
   const [copied, setCopied] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -156,6 +220,7 @@ function BookmarkRow({
       role="link"
       tabIndex={0}
       className={`bookmark-row${deleting ? " bookmark-row-deleting" : ""}`}
+      style={animationDelay !== undefined ? { animationDelay: `${animationDelay}ms` } : undefined}
       onClick={() => {
         if (!deleting && canOpenExternalUrl(bookmark.href)) {
           openUrl(bookmark.href);
@@ -189,16 +254,9 @@ function BookmarkRow({
               if (!deleting) {
                 if (!menuOpen && btnRef.current) {
                   const rect = btnRef.current.getBoundingClientRect();
-                  const menuH = 116; // ~3 items
                   const right = window.innerWidth - rect.right;
-                  const panelBottom = document.querySelector(".app")?.getBoundingClientRect().bottom ?? window.innerHeight;
-                  if (rect.bottom + menuH > panelBottom) {
-                    // Open up
-                    setMenuPos({ bottom: window.innerHeight - rect.top + 4, right });
-                  } else {
-                    // Open down, clamped within panel
-                    setMenuPos({ top: Math.min(rect.bottom + 4, panelBottom - menuH - 4), right });
-                  }
+                  // Always open above the button — avoids bottom-clipping for any row
+                  setMenuPos({ bottom: window.innerHeight - rect.top + 4, right });
                 }
                 setMenuOpen((v) => !v);
               }
@@ -268,6 +326,7 @@ function App() {
   const [isFetchingMeta, setIsFetchingMeta] = useState(false);
   const [editingHref, setEditingHref] = useState<string | null>(null);
   const metaFetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const metaFetchGen = useRef(0);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
 
@@ -337,11 +396,16 @@ function App() {
     setIsSubmittingToken(true);
     try {
       const token = tokenInput.trim();
-      await writeStoredToken(token);
+      // Backend first — instant, no vault overhead — UI transitions immediately
       await invoke("set_api_token", { token });
       syncLog("set_api_token completed");
       setHasToken(true);
       setTokenInput("");
+      // Vault write is fire-and-forget — never blocks the UI
+      writeStoredToken(token).catch((err) => {
+        console.error("[pinboarder-stronghold] background writeStoredToken failed, using localStorage fallback:", err);
+        window.localStorage.setItem("pinboarder_token_fallback", token);
+      });
       // Hydrate UI and sync in background; don't block setup transition.
       loadState().catch(console.error);
       setIsSyncing(true);
@@ -365,16 +429,18 @@ function App() {
     if (metaFetchTimer.current) clearTimeout(metaFetchTimer.current);
     const normalized = url.includes("://") ? url : `https://${url}`;
     try { new URL(normalized); } catch { return; } // not a valid URL yet
+    const gen = ++metaFetchGen.current;
     metaFetchTimer.current = setTimeout(async () => {
       setIsFetchingMeta(true);
       try {
         const meta = await invoke<{ title: string; tags: string[] }>("fetch_page_meta", { url: normalized });
+        if (gen !== metaFetchGen.current) return; // form was submitted/cleared, discard
         if (meta.title) setAddTitle(meta.title);
         if (meta.tags.length > 0) setAddTags(meta.tags);
       } catch {
         // silently ignore — user can fill in manually
       } finally {
-        setIsFetchingMeta(false);
+        if (gen === metaFetchGen.current) setIsFetchingMeta(false);
       }
     }, 700);
   }, []);
@@ -394,7 +460,9 @@ function App() {
     if (!addUrl.trim()) return;
     setIsAdding(true);
     setAddStatus("saving");
-    if (savedTimer.current) clearTimeout(savedTimer.current);
+    if (metaFetchTimer.current) clearTimeout(metaFetchTimer.current);
+    metaFetchGen.current++; // invalidate any in-flight fetch_page_meta
+    setIsFetchingMeta(false);
     try {
       const newUrl = normalizeUrl(addUrl.trim());
       // If editing and the URL changed, delete the old bookmark first
@@ -410,11 +478,11 @@ function App() {
       setAddTitle("");
       setAddTags([]);
       setTagInput("");
-      const wasEditing = !!editingHref;
       setEditingHref(null);
-      setAddStatus("saved");
-      savedTimer.current = setTimeout(() => setAddStatus("idle"), wasEditing ? 0 : 2000);
       await loadState();
+      setAddStatus("saved");
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      savedTimer.current = setTimeout(() => setAddStatus("idle"), 700);
     } catch {
       setAddStatus("idle");
     } finally {
@@ -429,6 +497,7 @@ function App() {
     try {
       await invoke("sync_now");
       syncLog("manual sync_now success");
+      invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
     } catch (err) {
       syncLog("manual sync_now failed", err);
       console.error("sync_now failed", err);
@@ -441,7 +510,10 @@ function App() {
 
   async function handleResetToken() {
     setMenuOpen(false);
-    await clearStoredToken();
+    // Fire vault clear in background — never block UI state reset
+    clearStoredToken().catch((err) =>
+      console.error("[pinboarder-stronghold] clearStoredToken background error:", err)
+    );
     await invoke("clear_api_token");
     setHasToken(false);
     setBookmarks([]);
@@ -460,13 +532,13 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
     (async () => {
       const token = await readStoredToken();
       syncLog("startup readStoredToken", { hasToken: !!token });
       if (active && token) {
         await invoke("set_api_token", { token });
         syncLog("startup set_api_token from local store success");
+        invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
       }
       if (active) {
         await loadState();
@@ -482,6 +554,7 @@ function App() {
             })
             .finally(() => {
               loadState().catch(console.error);
+              invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
               if (active) setIsSyncing(false);
               syncLog("startup sync_now done");
             });
@@ -590,7 +663,7 @@ function App() {
               type="submit"
               disabled={isSubmittingToken || !tokenInput.trim()}
             >
-              {isSubmittingToken ? "Connecting…" : "Connect"}
+              {isSubmittingToken ? <>Connecting<LoadingDots /></> : "Connect"}
             </button>
           </form>
           <button
@@ -613,9 +686,16 @@ function App() {
               placeholder="Paste URL..."
               value={addUrl}
               onChange={(e) => {
-                setAddUrl(e.currentTarget.value);
-                if (hasBookmarks && !editingHref) {
-                  fetchMetaForUrl(e.currentTarget.value);
+                const val = e.currentTarget.value;
+                setAddUrl(val);
+                if (!val.trim()) {
+                  if (metaFetchTimer.current) clearTimeout(metaFetchTimer.current);
+                  metaFetchGen.current++;
+                  setIsFetchingMeta(false);
+                  setAddTitle("");
+                  setAddTags([]);
+                } else if (hasBookmarks && !editingHref) {
+                  fetchMetaForUrl(val);
                 }
               }}
               spellCheck={false}
@@ -705,18 +785,16 @@ function App() {
                   Cancel
                 </button>
               )}
-              {addStatus === "saving" && (
-                <span className="add-status add-status-saving">saving…</span>
-              )}
-              {addStatus === "saved" && (
-                <span className="add-status add-status-saved">saved ✓</span>
-              )}
               <button
-                className="btn-add"
+                className={`btn-add${addStatus === "saved" ? " btn-add-saved" : ""}`}
                 type="submit"
                 disabled={isAdding || !addUrl.trim()}
               >
-                {editingHref ? "↓ Save" : "+ Add"}
+                {isAdding
+                  ? <>{editingHref ? "↓ Save" : "+ Add"}<LoadingDots /></>
+                  : addStatus === "saved"
+                    ? "✓ Saved"
+                    : editingHref ? "↓ Save" : "+ Add"}
               </button>
             </div>
           </form>
@@ -724,15 +802,17 @@ function App() {
           {/* List header */}
           <div className="list-header">
             <span>Recent</span>
+            {isSyncing && <span className="list-header-syncing">syncing<LoadingDots /></span>}
           </div>
 
           {/* Bookmarks or empty */}
           {hasBookmarks ? (
             <div className="bookmark-list">
-              {bookmarks.map((bm) => (
+              {bookmarks.map((bm, i) => (
                 <BookmarkRow
                   bookmark={bm}
                   key={bm.href_norm}
+                  animationDelay={Math.min(i * 40, 240)}
                   onDelete={async (href) => {
                     await invoke("delete_bookmark", { href });
                     await loadState();
@@ -746,7 +826,7 @@ function App() {
                   onClick={loadMore}
                   disabled={isLoadingMore}
                 >
-                  {isLoadingMore ? "loading…" : "load more"}
+                  {isLoadingMore ? <>loading<LoadingDots /></> : "load more"}
                 </button>
               )}
             </div>

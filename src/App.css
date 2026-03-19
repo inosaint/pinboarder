@@ -370,16 +370,52 @@ body {
   border-radius: 5px;
   cursor: pointer;
   flex-shrink: 0;
-  transition: background 0.12s;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  transition: background 0.12s, transform 120ms cubic-bezier(0.23, 1, 0.32, 1);
 }
 
 .btn-primary:hover:not(:disabled) {
   background: var(--ink);
 }
 
+.btn-primary:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
 .btn-primary:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+.loading-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 4px;
+  vertical-align: middle;
+  position: relative;
+  top: -0.5px;
+}
+
+.loading-dot {
+  display: block;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.3;
+  animation: dotPulse 1.2s ease-in-out infinite;
+}
+
+.loading-dot:nth-child(1) { animation-delay: 0ms; }
+.loading-dot:nth-child(2) { animation-delay: 160ms; }
+.loading-dot:nth-child(3) { animation-delay: 320ms; }
+
+@keyframes dotPulse {
+  0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-2px); }
 }
 
 .setup-link {
@@ -578,18 +614,9 @@ body {
   background: rgba(255, 59, 17, 0.04);
 }
 
-.add-status {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  animation: fadeIn 0.15s ease;
-}
-
-.add-status-saving {
-  color: var(--ink-muted);
-}
-
-.add-status-saved {
-  color: var(--green);
+@keyframes statusPop {
+  from { opacity: 0; transform: scale(0.85); }
+  to   { opacity: 1; transform: scale(1); }
 }
 
 .btn-add {
@@ -602,16 +629,42 @@ body {
   border: none;
   border-radius: 5px;
   cursor: pointer;
-  transition: background 0.12s;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: background 0.5s cubic-bezier(0.23, 1, 0.32, 1), transform 120ms cubic-bezier(0.23, 1, 0.32, 1);
 }
 
-.btn-add:hover:not(:disabled) {
+.btn-add:hover:not(:disabled):not(.btn-add-saved) {
   background: var(--ink);
+}
+
+.btn-add:active:not(:disabled) {
+  transform: scale(0.96);
 }
 
 .btn-add:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+.btn-add-saved {
+  background: var(--green);
+  cursor: default;
+}
+
+/* ── List header syncing state ── */
+.list-header-syncing {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 400;
+  color: var(--amber);
+  text-transform: none;
+  letter-spacing: 0;
+  animation: statusPop 180ms cubic-bezier(0.23, 1, 0.32, 1) backwards;
 }
 
 /* ── List header ── */
@@ -688,6 +741,24 @@ body {
   text-decoration: none;
   transition: background 0.08s;
   cursor: pointer;
+  animation: rowIn 320ms cubic-bezier(0.23, 1, 0.32, 1) backwards;
+}
+
+@keyframes rowIn {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bookmark-row {
+    animation: none;
+  }
 }
 
 .bookmark-row:hover {

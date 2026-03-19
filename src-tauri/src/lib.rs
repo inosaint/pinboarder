@@ -209,6 +209,19 @@ fn start_sync_loop(app: &AppHandle, state: SharedState) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_stronghold::Builder::new(|password| {
+            // Reduced params (m=4096, t=1, p=1) — fast enough for a local desktop vault
+            // while still deriving a proper 32-byte key. The vault file lives in
+            // appLocalDataDir which macOS already protects via sandboxing.
+            let params = argon2::Params::new(4096, 1, 1, Some(32))
+                .expect("argon2 params invalid");
+            let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+            let mut key = [0u8; 32];
+            argon2
+                .hash_password_into(password.as_bytes(), b"pinboarder-vault-salt", &mut key)
+                .expect("argon2 key derivation failed");
+            key.to_vec()
+        }).build())
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
             if window.label() == "main" {

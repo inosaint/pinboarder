@@ -11,9 +11,6 @@ use tokio::time::{sleep, Duration};
 use url::Url;
 use uuid::Uuid;
 
-const LEGACY_TOKEN_FILE_NAME: &str = "token";
-const TOKEN_CONFIG_KEY: &str = "api_token";
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bookmark {
     pub href: String,
@@ -41,6 +38,7 @@ pub struct PinboardCore {
     db_path: PathBuf,
     client: reqwest::Client,
     token_cache: Mutex<Option<String>>,
+    sync_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,14 +184,6 @@ impl PinboardCore {
     pub fn new(app_data_dir: &std::path::Path) -> Result<Self, String> {
         std::fs::create_dir_all(app_data_dir).map_err(to_string_err)?;
         let db_path = app_data_dir.join("pinboarder.sqlite");
-        let legacy_token_path = app_data_dir.join(LEGACY_TOKEN_FILE_NAME);
-        let initial_token = std::fs::read_to_string(&legacy_token_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        if initial_token.is_some() {
-            let _ = std::fs::remove_file(&legacy_token_path);
-        }
         let core = Self {
             db_path,
             client: reqwest::Client::builder()
@@ -201,16 +191,9 @@ impl PinboardCore {
                 .build()
                 .map_err(to_string_err)?,
             token_cache: Mutex::new(None),
+            sync_lock: tokio::sync::Mutex::new(()),
         };
         core.migrate()?;
-        let sqlite_token = core.load_persisted_token()?;
-        let startup_token = initial_token.or(sqlite_token);
-        if let Some(token) = startup_token.clone() {
-            core.persist_token(&token)?;
-        }
-        if let Ok(mut cache) = core.token_cache.lock() {
-            *cache = startup_token;
-        }
         Ok(core)
     }
 
@@ -249,10 +232,6 @@ impl PinboardCore {
               backoff_seconds INTEGER NOT NULL DEFAULT 0,
               last_error TEXT
             );
-            CREATE TABLE IF NOT EXISTS app_config (
-              key TEXT PRIMARY KEY,
-              value TEXT NOT NULL
-            );
             INSERT OR IGNORE INTO sync_state (id) VALUES (1);
             "#,
         )
@@ -268,8 +247,7 @@ impl PinboardCore {
         if let Ok(mut cache) = self.token_cache.lock() {
             *cache = Some(token.clone());
         }
-        self.persist_token(&token)?;
-        sync_log("set_token persisted");
+        sync_log("set_token cached");
         Ok(())
     }
 
@@ -281,7 +259,6 @@ impl PinboardCore {
         if let Ok(mut cache) = self.token_cache.lock() {
             *cache = None;
         }
-        self.delete_persisted_token()?;
         self.clear_local_cache()?;
         sync_log("clear_token completed and local cache wiped");
         Ok(())
@@ -489,13 +466,17 @@ impl PinboardCore {
             sync_log("sync_once skipped: no token");
             return Ok(());
         }
+        let Ok(_guard) = self.sync_lock.try_lock() else {
+            sync_log("sync_once skipped: sync already in progress");
+            return Ok(());
+        };
         sync_log("sync_once started");
         // If local cache is empty, force an initial hydration even when
         // Pinboard's update endpoint reports "no change".
         if self.bookmark_count()? == 0 {
             sync_log("sync_once local cache empty; forcing pull_recent");
             self.pull_recent().await?;
-            self.flush_pending_writes().await?;
+            self.do_flush_pending_writes().await?;
             sync_log("sync_once completed via forced hydration");
             return Ok(());
         }
@@ -504,7 +485,7 @@ impl PinboardCore {
         if changed {
             self.pull_recent().await?;
         }
-        self.flush_pending_writes().await?;
+        self.do_flush_pending_writes().await?;
         sync_log("sync_once completed");
         Ok(())
     }
@@ -514,9 +495,13 @@ impl PinboardCore {
             sync_log("initial_sync skipped: no token");
             return Ok(());
         }
+        let Ok(_guard) = self.sync_lock.try_lock() else {
+            sync_log("initial_sync skipped: sync already in progress");
+            return Ok(());
+        };
         sync_log("initial_sync started");
         self.pull_recent().await?;
-        self.flush_pending_writes().await?;
+        self.do_flush_pending_writes().await?;
         sync_log("initial_sync completed");
         Ok(())
     }
@@ -663,8 +648,8 @@ impl PinboardCore {
                 Err(err) => {
                     skipped_invalid += 1;
                     sync_log(&format!(
-                        "pull_recent skipped invalid href='{}' reason={}",
-                        post.href, err
+                        "pull_recent skipped invalid href reason={}",
+                        err
                     ));
                     continue;
                 }
@@ -701,11 +686,22 @@ impl PinboardCore {
         Ok(())
     }
 
+    /// Public entry point: acquires sync_lock before flushing.
+    /// Called from quick_add_bookmark (outside any existing lock).
     pub async fn flush_pending_writes(&self) -> Result<(), String> {
         if !self.has_token() {
             sync_log("flush_pending_writes skipped: no token");
             return Ok(());
         }
+        let Ok(_guard) = self.sync_lock.try_lock() else {
+            sync_log("flush_pending_writes skipped: sync already in progress");
+            return Ok(());
+        };
+        self.do_flush_pending_writes().await
+    }
+
+    /// Inner flush — caller must already hold sync_lock (or be the sole writer).
+    async fn do_flush_pending_writes(&self) -> Result<(), String> {
         let mut processed = 0_i64;
         loop {
             let maybe_item = self.next_pending_write()?;
@@ -715,8 +711,8 @@ impl PinboardCore {
             };
             processed += 1;
             sync_log(&format!(
-                "flush_pending_writes sending id={} href={}",
-                item.id, item.href
+                "flush_pending_writes sending id={}",
+                item.id
             ));
             self.wait_for_rate_limit(false).await?;
             let token = self.get_token()?;
@@ -963,40 +959,6 @@ impl PinboardCore {
         Connection::open(&self.db_path).map_err(to_string_err)
     }
 
-    fn load_persisted_token(&self) -> Result<Option<String>, String> {
-        let conn = self.conn()?;
-        let token = conn
-            .query_row(
-                "SELECT value FROM app_config WHERE key=?1 LIMIT 1",
-                params![TOKEN_CONFIG_KEY],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        Ok(token)
-    }
-
-    fn persist_token(&self, token: &str) -> Result<(), String> {
-        let conn = self.conn()?;
-        conn.execute(
-            "INSERT INTO app_config (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            params![TOKEN_CONFIG_KEY, token],
-        )
-        .map_err(to_string_err)?;
-        Ok(())
-    }
-
-    fn delete_persisted_token(&self) -> Result<(), String> {
-        let conn = self.conn()?;
-        conn.execute(
-            "DELETE FROM app_config WHERE key=?1",
-            params![TOKEN_CONFIG_KEY],
-        )
-        .map_err(to_string_err)?;
-        Ok(())
-    }
 }
 
 fn is_blocked_host(host: &str) -> bool {
