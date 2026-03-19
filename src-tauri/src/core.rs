@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use rusqlite::{params, Connection};
+use serde::de::{self, Deserializer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::net::IpAddr;
@@ -9,8 +10,6 @@ use std::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use url::Url;
 use uuid::Uuid;
-
-const LEGACY_TOKEN_FILE_NAME: &str = "token";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bookmark {
@@ -39,16 +38,53 @@ pub struct PinboardCore {
     db_path: PathBuf,
     client: reqwest::Client,
     token_cache: Mutex<Option<String>>,
+    sync_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Debug, Deserialize)]
 struct RecentPost {
     href: String,
     description: String,
-    #[serde(default)]
+    #[serde(default, alias = "tags", deserialize_with = "deserialize_pinboard_tags")]
     tag: String,
     #[serde(default)]
     time: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PostsAllResponse {
+    #[serde(default)]
+    posts: Vec<RecentPost>,
+}
+
+fn deserialize_pinboard_tags<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Array(items) => {
+            let out = items
+                .into_iter()
+                .filter_map(|v| match v {
+                    serde_json::Value::String(s) => {
+                        let t = s.trim();
+                        if t.is_empty() {
+                            None
+                        } else {
+                            Some(t.to_string())
+                        }
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<String>>()
+                .join(" ");
+            Ok(out)
+        }
+        _ => Err(de::Error::custom("unsupported tag payload")),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,21 +184,14 @@ impl PinboardCore {
     pub fn new(app_data_dir: &std::path::Path) -> Result<Self, String> {
         std::fs::create_dir_all(app_data_dir).map_err(to_string_err)?;
         let db_path = app_data_dir.join("pinboarder.sqlite");
-        let legacy_token_path = app_data_dir.join(LEGACY_TOKEN_FILE_NAME);
-        let initial_token = std::fs::read_to_string(&legacy_token_path)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        if initial_token.is_some() {
-            let _ = std::fs::remove_file(&legacy_token_path);
-        }
         let core = Self {
             db_path,
             client: reqwest::Client::builder()
                 .user_agent("pinboarder/0.1.0")
                 .build()
                 .map_err(to_string_err)?,
-            token_cache: Mutex::new(initial_token),
+            token_cache: Mutex::new(None),
+            sync_lock: tokio::sync::Mutex::new(()),
         };
         core.migrate()?;
         Ok(core)
@@ -214,9 +243,11 @@ impl PinboardCore {
         if !token.contains(':') {
             return Err("Token must be in username:TOKEN format".to_string());
         }
+        let token = token.trim().to_string();
         if let Ok(mut cache) = self.token_cache.lock() {
-            *cache = Some(token.trim().to_string());
+            *cache = Some(token.clone());
         }
+        sync_log("set_token cached");
         Ok(())
     }
 
@@ -229,6 +260,7 @@ impl PinboardCore {
             *cache = None;
         }
         self.clear_local_cache()?;
+        sync_log("clear_token completed and local cache wiped");
         Ok(())
     }
 
@@ -386,6 +418,7 @@ impl PinboardCore {
             params![now_epoch()],
         )
         .map_err(to_string_err)?;
+        sync_log("mark_manual_sync_success updated last_sync_epoch");
         Ok(())
     }
 
@@ -430,22 +463,46 @@ impl PinboardCore {
 
     pub async fn sync_once(&self) -> Result<(), String> {
         if !self.has_token() {
+            sync_log("sync_once skipped: no token");
+            return Ok(());
+        }
+        let Ok(_guard) = self.sync_lock.try_lock() else {
+            sync_log("sync_once skipped: sync already in progress");
+            return Ok(());
+        };
+        sync_log("sync_once started");
+        // If local cache is empty, force an initial hydration even when
+        // Pinboard's update endpoint reports "no change".
+        if self.bookmark_count()? == 0 {
+            sync_log("sync_once local cache empty; forcing pull_recent");
+            self.pull_recent().await?;
+            self.do_flush_pending_writes().await?;
+            sync_log("sync_once completed via forced hydration");
             return Ok(());
         }
         let changed = self.check_update().await?;
+        sync_log(&format!("sync_once check_update changed={}", changed));
         if changed {
             self.pull_recent().await?;
         }
-        self.flush_pending_writes().await?;
+        self.do_flush_pending_writes().await?;
+        sync_log("sync_once completed");
         Ok(())
     }
 
     pub async fn initial_sync(&self) -> Result<(), String> {
         if !self.has_token() {
+            sync_log("initial_sync skipped: no token");
             return Ok(());
         }
+        let Ok(_guard) = self.sync_lock.try_lock() else {
+            sync_log("initial_sync skipped: sync already in progress");
+            return Ok(());
+        };
+        sync_log("initial_sync started");
         self.pull_recent().await?;
-        self.flush_pending_writes().await?;
+        self.do_flush_pending_writes().await?;
+        sync_log("initial_sync completed");
         Ok(())
     }
 
@@ -514,8 +571,10 @@ impl PinboardCore {
             .map_err(to_string_err)?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             self.apply_backoff(60)?;
+            sync_log("check_update rate limited (429)");
             return Err("Rate limited by Pinboard API".to_string());
         }
+        sync_log(&format!("check_update http status={}", response.status()));
         let value: serde_json::Value = response.json().await.map_err(to_string_err)?;
         let parsed: Result<UpdateResponse, _> = serde_json::from_value(value.clone());
         let update_time = parsed
@@ -529,21 +588,28 @@ impl PinboardCore {
         let previous: Option<String> = conn
             .query_row("SELECT last_update_time FROM sync_state WHERE id=1", [], |row| row.get(0))
             .map_err(to_string_err)?;
+        sync_log(&format!(
+            "check_update previous={:?} new={:?}",
+            previous.as_deref(),
+            Some(update_time.as_str())
+        ));
         if previous.as_deref() != Some(update_time.as_str()) {
             conn.execute(
                 "UPDATE sync_state SET last_update_time=?1 WHERE id=1",
                 params![update_time],
             )
             .map_err(to_string_err)?;
+            sync_log("check_update detected remote change");
             return Ok(true);
         }
+        sync_log("check_update no remote change");
         Ok(false)
     }
 
     async fn pull_recent(&self) -> Result<(), String> {
         self.wait_for_rate_limit(true).await?;
         let token = self.get_token()?;
-        // posts/all returns every bookmark as a bare JSON array
+        // posts/all may return either a bare array or an object with `posts`.
         let response = self
             .client
             .get("https://api.pinboard.in/v1/posts/all")
@@ -554,14 +620,40 @@ impl PinboardCore {
 
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             self.apply_backoff(60)?;
+            sync_log("pull_recent rate limited (429)");
             return Err("Rate limited by Pinboard API".to_string());
         }
-        let posts: Vec<RecentPost> = response.json().await
-            .map_err(|_| "Failed to parse posts/all response".to_string())?;
+        sync_log(&format!("pull_recent http status={}", response.status()));
+        let body = response.text().await.map_err(to_string_err)?;
+        sync_log(&format!("pull_recent body bytes={}", body.len()));
+        let posts: Vec<RecentPost> = if let Ok(list) = serde_json::from_str::<Vec<RecentPost>>(&body) {
+            list
+        } else if let Ok(wrapped) = serde_json::from_str::<PostsAllResponse>(&body) {
+            wrapped.posts
+        } else {
+            sync_log("pull_recent parse failure");
+            return Err(format!(
+                "Failed to parse posts/all response: {}",
+                body.chars().take(180).collect::<String>()
+            ));
+        };
+        sync_log(&format!("pull_recent parsed posts={}", posts.len()));
         let conn = self.conn()?;
         let tx = conn.unchecked_transaction().map_err(to_string_err)?;
+        let mut inserted = 0_i64;
+        let mut skipped_invalid = 0_i64;
         for post in posts {
-            let href_norm = normalize_url(&post.href)?;
+            let href_norm = match normalize_url(&post.href) {
+                Ok(v) => v,
+                Err(err) => {
+                    skipped_invalid += 1;
+                    sync_log(&format!(
+                        "pull_recent skipped invalid href reason={}",
+                        err
+                    ));
+                    continue;
+                }
+            };
             tx.execute(
                 "INSERT OR REPLACE INTO bookmarks
                  (href_norm, href, title, tags, time_remote, source, pending_write_id, updated_at)
@@ -576,6 +668,7 @@ impl PinboardCore {
                 ],
             )
             .map_err(to_string_err)?;
+            inserted += 1;
         }
         tx.execute(
             "UPDATE sync_state
@@ -586,19 +679,41 @@ impl PinboardCore {
         .map_err(to_string_err)?;
         tx.commit().map_err(to_string_err)?;
         self.mark_rate_success(true)?;
+        sync_log(&format!(
+            "pull_recent committed local bookmarks and updated last_sync_epoch inserted={} skipped_invalid={}",
+            inserted, skipped_invalid
+        ));
         Ok(())
     }
 
+    /// Public entry point: acquires sync_lock before flushing.
+    /// Called from quick_add_bookmark (outside any existing lock).
     pub async fn flush_pending_writes(&self) -> Result<(), String> {
         if !self.has_token() {
+            sync_log("flush_pending_writes skipped: no token");
             return Ok(());
         }
+        let Ok(_guard) = self.sync_lock.try_lock() else {
+            sync_log("flush_pending_writes skipped: sync already in progress");
+            return Ok(());
+        };
+        self.do_flush_pending_writes().await
+    }
+
+    /// Inner flush — caller must already hold sync_lock (or be the sole writer).
+    async fn do_flush_pending_writes(&self) -> Result<(), String> {
+        let mut processed = 0_i64;
         loop {
             let maybe_item = self.next_pending_write()?;
             let item = match maybe_item {
                 Some(x) => x,
                 None => break,
             };
+            processed += 1;
+            sync_log(&format!(
+                "flush_pending_writes sending id={}",
+                item.id
+            ));
             self.wait_for_rate_limit(false).await?;
             let token = self.get_token()?;
             let url = "https://api.pinboard.in/v1/posts/add";
@@ -619,26 +734,42 @@ impl PinboardCore {
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 self.mark_retry(&item.id, "429 rate limited")?;
                 self.apply_backoff(3)?;
+                sync_log(&format!("flush_pending_writes id={} rate limited", item.id));
                 continue;
             }
+            sync_log(&format!(
+                "flush_pending_writes id={} http status={}",
+                item.id,
+                response.status()
+            ));
 
             let parsed: Result<AddResult, _> = response.json().await.map_err(to_string_err);
             match parsed {
                 Ok(result) if result.result_code.as_deref() == Some("done") => {
                     self.mark_write_success(&item.id)?;
                     self.mark_rate_success(false)?;
+                    sync_log(&format!("flush_pending_writes id={} succeeded", item.id));
                 }
                 Ok(result) => {
                     self.mark_write_permanent_failure(
                         &item.id,
                         format!("add failed: {:?}", result.result_code).as_str(),
                     )?;
+                    sync_log(&format!(
+                        "flush_pending_writes id={} permanent failure code={:?}",
+                        item.id, result.result_code
+                    ));
                 }
                 Err(err) => {
                     self.mark_retry(&item.id, &err)?;
+                    sync_log(&format!(
+                        "flush_pending_writes id={} retry due to error={}",
+                        item.id, err
+                    ));
                 }
             }
         }
+        sync_log(&format!("flush_pending_writes completed processed={}", processed));
         Ok(())
     }
 
@@ -827,6 +958,7 @@ impl PinboardCore {
     fn conn(&self) -> Result<Connection, String> {
         Connection::open(&self.db_path).map_err(to_string_err)
     }
+
 }
 
 fn is_blocked_host(host: &str) -> bool {
@@ -859,6 +991,10 @@ struct PendingWrite {
     href: String,
     title: String,
     tags: String,
+}
+
+fn sync_log(message: &str) {
+    eprintln!("[pinboarder-sync][{}] {}", Utc::now().to_rfc3339(), message);
 }
 
 fn now_epoch() -> i64 {

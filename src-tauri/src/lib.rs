@@ -76,9 +76,11 @@ async fn get_user_tags(state: tauri::State<'_, SharedState>) -> Result<Vec<Strin
 
 #[tauri::command]
 async fn sync_now(state: tauri::State<'_, SharedState>, app: AppHandle) -> Result<(), String> {
-    state.core.sync_once().await?;
+    app_sync_log("sync_now command started");
+    state.core.initial_sync().await?;
     state.core.mark_manual_sync_success()?;
     refresh_recent_and_tray(&app, &state)?;
+    app_sync_log("sync_now command completed");
     Ok(())
 }
 
@@ -184,11 +186,21 @@ fn toggle_panel_at_tray(app: &AppHandle, rect: Rect, state: &SharedState) {
 fn start_sync_loop(app: &AppHandle, state: SharedState) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
-        let _ = state.core.initial_sync().await;
-        let _ = refresh_recent_and_tray(&app_handle, &state);
+        app_sync_log("background sync loop started");
+        if let Err(err) = state.core.initial_sync().await {
+            app_sync_log(&format!("background initial_sync failed: {}", err));
+        }
+        if let Err(err) = refresh_recent_and_tray(&app_handle, &state) {
+            app_sync_log(&format!("background refresh_recent_and_tray failed: {}", err));
+        }
         loop {
-            let _ = state.core.sync_once().await;
-            let _ = refresh_recent_and_tray(&app_handle, &state);
+            app_sync_log("background sync tick");
+            if let Err(err) = state.core.sync_once().await {
+                app_sync_log(&format!("background sync_once failed: {}", err));
+            }
+            if let Err(err) = refresh_recent_and_tray(&app_handle, &state) {
+                app_sync_log(&format!("background refresh_recent_and_tray failed: {}", err));
+            }
             tokio::time::sleep(std::time::Duration::from_secs(180)).await;
         }
     });
@@ -197,6 +209,19 @@ fn start_sync_loop(app: &AppHandle, state: SharedState) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_stronghold::Builder::new(|password| {
+            // Reduced params (m=4096, t=1, p=1) — fast enough for a local desktop vault
+            // while still deriving a proper 32-byte key. The vault file lives in
+            // appLocalDataDir which macOS already protects via sandboxing.
+            let params = argon2::Params::new(4096, 1, 1, Some(32))
+                .expect("argon2 params invalid");
+            let argon2 = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+            let mut key = [0u8; 32];
+            argon2
+                .hash_password_into(password.as_bytes(), b"pinboarder-vault-salt", &mut key)
+                .expect("argon2 key derivation failed");
+            key.to_vec()
+        }).build())
         .plugin(tauri_plugin_opener::init())
         .on_window_event(|window, event| {
             if window.label() == "main" {
@@ -221,15 +246,6 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(ActivationPolicy::Accessory);
-
-            let salt_path = app
-                .path()
-                .app_local_data_dir()
-                .map_err(to_string_err)?
-                .join("stronghold-salt.txt");
-            app.handle()
-                .plugin(tauri_plugin_stronghold::Builder::with_argon2(&salt_path).build())
-                .map_err(to_string_err)?;
 
             let app_data_dir = app
                 .path()
@@ -304,4 +320,12 @@ pub fn run() {
 
 fn to_string_err<E: std::fmt::Display>(err: E) -> String {
     err.to_string()
+}
+
+fn app_sync_log(message: &str) {
+    eprintln!(
+        "[pinboarder-sync-app][{}] {}",
+        chrono::Utc::now().to_rfc3339(),
+        message
+    );
 }

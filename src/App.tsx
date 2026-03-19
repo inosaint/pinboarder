@@ -1,8 +1,8 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { appDataDir } from "@tauri-apps/api/path";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { appLocalDataDir, join } from "@tauri-apps/api/path";
 import { Stronghold } from "@tauri-apps/plugin-stronghold";
 import "./App.css";
 
@@ -30,45 +30,78 @@ type OpenUrlEvent = { url: string };
 
 const STRONGHOLD_CLIENT_NAME = "pinboarder";
 const STRONGHOLD_TOKEN_KEY = "pinboard_api_token";
-const STRONGHOLD_PASSWORD = "pinboarder-stronghold-v1";
+const STRONGHOLD_PASSWORD = "pinboarder-vault-v1";
 
-async function getStrongholdStore() {
-  const vaultPath = `${await appDataDir()}pinboarder.vault.hold`;
-  const stronghold = await Stronghold.load(vaultPath, STRONGHOLD_PASSWORD);
-  let client;
-  try {
-    client = await stronghold.loadClient(STRONGHOLD_CLIENT_NAME);
-  } catch {
-    client = await stronghold.createClient(STRONGHOLD_CLIENT_NAME);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let _storePromise: Promise<{ stronghold: Stronghold; store: any }> | null = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function getStore(): Promise<{ stronghold: Stronghold; store: any }> {
+  if (!_storePromise) {
+    console.log("[pinboarder-stronghold] getStore: initializing vault (argon2 will run once)");
+    _storePromise = (async () => {
+      const vaultPath = await join(await appLocalDataDir(), "pinboarder.vault.hold");
+      console.log("[pinboarder-stronghold] vault path:", vaultPath);
+      const stronghold = await Stronghold.load(vaultPath, STRONGHOLD_PASSWORD);
+      console.log("[pinboarder-stronghold] Stronghold.load completed");
+      let client;
+      try {
+        client = await stronghold.loadClient(STRONGHOLD_CLIENT_NAME);
+        console.log("[pinboarder-stronghold] loadClient succeeded");
+      } catch {
+        console.log("[pinboarder-stronghold] loadClient failed, creating new client");
+        client = await stronghold.createClient(STRONGHOLD_CLIENT_NAME);
+        console.log("[pinboarder-stronghold] createClient succeeded");
+      }
+      return { stronghold, store: client.getStore() };
+    })();
+    _storePromise.catch((err) => {
+      console.error("[pinboarder-stronghold] vault init failed:", err);
+      _storePromise = null; // allow retry on next call
+    });
+  } else {
+    console.log("[pinboarder-stronghold] getStore: reusing cached vault");
   }
-  return { stronghold, store: client.getStore() };
+  return _storePromise;
 }
 
 async function readStoredToken(): Promise<string | null> {
   try {
-    const { store } = await getStrongholdStore();
-    const bytes = await store.get(STRONGHOLD_TOKEN_KEY);
-    if (!bytes || bytes.length === 0) return null;
-    return new TextDecoder().decode(new Uint8Array(bytes)).trim() || null;
-  } catch {
-    return null;
+    console.log("[pinboarder-stronghold] readStoredToken start");
+    const { store } = await getStore();
+    const raw = await store.get(STRONGHOLD_TOKEN_KEY);
+    const token = raw ? new TextDecoder().decode(new Uint8Array(raw)).trim() : null;
+    console.log("[pinboarder-stronghold] readStoredToken result:", token ? "found" : "not found");
+    if (token) return token;
+  } catch (err) {
+    console.error("[pinboarder-stronghold] readStoredToken error (trying fallback):", err);
   }
+  // Fallback: check localStorage (used when Stronghold fails)
+  const fallback = window.localStorage.getItem("pinboarder_token_fallback");
+  if (fallback) console.log("[pinboarder-stronghold] readStoredToken: using localStorage fallback");
+  return fallback?.trim() || null;
 }
 
 async function writeStoredToken(token: string): Promise<void> {
-  const { stronghold, store } = await getStrongholdStore();
-  const bytes = Array.from(new TextEncoder().encode(token));
-  await store.insert(STRONGHOLD_TOKEN_KEY, bytes);
+  console.log("[pinboarder-stronghold] writeStoredToken start");
+  const { stronghold, store } = await getStore();
+  await store.insert(STRONGHOLD_TOKEN_KEY, Array.from(new TextEncoder().encode(token)));
   await stronghold.save();
+  window.localStorage.removeItem("pinboarder_token_fallback"); // clear fallback once Stronghold succeeds
+  console.log("[pinboarder-stronghold] writeStoredToken saved");
 }
 
 async function clearStoredToken(): Promise<void> {
+  window.localStorage.removeItem("pinboarder_token_fallback");
+  // Do NOT reset _storePromise — vault stays open, we just remove the key
   try {
-    const { stronghold, store } = await getStrongholdStore();
+    console.log("[pinboarder-stronghold] clearStoredToken start");
+    const { stronghold, store } = await getStore();
     await store.remove(STRONGHOLD_TOKEN_KEY);
     await stronghold.save();
-  } catch {
-    // ignore cleanup failures, app state is still cleared
+    console.log("[pinboarder-stronghold] clearStoredToken saved");
+  } catch (err) {
+    console.error("[pinboarder-stronghold] clearStoredToken error (ignored):", err);
   }
 }
 
@@ -113,18 +146,21 @@ function formatElapsedSync(secondsAgo: number): string {
   return "just now";
 }
 
-function TagDots({ tags }: { tags: string }) {
-  const count = tags
-    .split(/[,\s]+/)
-    .map((x) => x.trim())
-    .filter(Boolean).length;
-  if (count === 0) return null;
+function syncLog(message: string, extra?: unknown) {
+  if (extra !== undefined) {
+    console.log(`[pinboarder-sync-ui] ${message}`, extra);
+    return;
+  }
+  console.log(`[pinboarder-sync-ui] ${message}`);
+}
+
+function LoadingDots() {
   return (
-    <div className="tag-dots">
-      {Array.from({ length: Math.min(count, 8) }).map((_, i) => (
-        <span className="tag-dot" key={i} />
-      ))}
-    </div>
+    <span className="loading-dots" aria-hidden="true">
+      <span className="loading-dot" />
+      <span className="loading-dot" />
+      <span className="loading-dot" />
+    </span>
   );
 }
 
@@ -132,14 +168,16 @@ function BookmarkRow({
   bookmark,
   onDelete,
   onEdit,
+  animationDelay,
 }: {
   bookmark: Bookmark;
   onDelete: (href: string) => Promise<void>;
   onEdit: (bookmark: Bookmark) => void;
+  animationDelay?: number;
 }) {
   const [deleting, setDeleting] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [menuPos, setMenuPos] = useState<{ top?: number; bottom?: number; right: number } | null>(null);
+  const [menuPos, setMenuPos] = useState<{ bottom: number; right: number } | null>(null);
   const [copied, setCopied] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const btnRef = useRef<HTMLButtonElement>(null);
@@ -182,6 +220,7 @@ function BookmarkRow({
       role="link"
       tabIndex={0}
       className={`bookmark-row${deleting ? " bookmark-row-deleting" : ""}`}
+      style={animationDelay !== undefined ? { animationDelay: `${animationDelay}ms` } : undefined}
       onClick={() => {
         if (!deleting && canOpenExternalUrl(bookmark.href)) {
           openUrl(bookmark.href);
@@ -215,16 +254,9 @@ function BookmarkRow({
               if (!deleting) {
                 if (!menuOpen && btnRef.current) {
                   const rect = btnRef.current.getBoundingClientRect();
-                  const menuH = 116; // ~3 items
                   const right = window.innerWidth - rect.right;
-                  const panelBottom = document.querySelector(".app")?.getBoundingClientRect().bottom ?? window.innerHeight;
-                  if (rect.bottom + menuH > panelBottom) {
-                    // Open up
-                    setMenuPos({ bottom: window.innerHeight - rect.top + 4, right });
-                  } else {
-                    // Open down, clamped within panel
-                    setMenuPos({ top: Math.min(rect.bottom + 4, panelBottom - menuH - 4), right });
-                  }
+                  // Always open above the button — avoids bottom-clipping for any row
+                  setMenuPos({ bottom: window.innerHeight - rect.top + 4, right });
                 }
                 setMenuOpen((v) => !v);
               }
@@ -269,7 +301,7 @@ const PAGE_SIZE = 25;
 function App() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const bookmarkOffsetRef = useRef(PAGE_SIZE);
-  const [bookmarkTotal, setBookmarkTotal] = useState(0);
+  const [hasMoreBookmarks, setHasMoreBookmarks] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [userTags, setUserTags] = useState<string[]>([]);
   const [status, setStatus] = useState<SyncStatus | null>(null);
@@ -294,6 +326,7 @@ function App() {
   const [isFetchingMeta, setIsFetchingMeta] = useState(false);
   const [editingHref, setEditingHref] = useState<string | null>(null);
   const metaFetchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const metaFetchGen = useRef(0);
   const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
 
@@ -311,21 +344,28 @@ function App() {
   }, [isSyncing, status]);
 
   async function loadState() {
-    const [page, syncStatus, tokenPresent, total] = await Promise.all([
+    syncLog("loadState start");
+    const [page, syncStatus, tokenPresent] = await Promise.all([
       invoke<BookmarkPage>("get_recent_bookmarks_page", { limit: PAGE_SIZE, offset: 0 }),
       invoke<SyncStatus>("get_sync_status"),
       invoke<boolean>("has_api_token"),
-      invoke<number>("get_bookmark_count"),
     ]);
     setBookmarks(page.items);
+    setHasMoreBookmarks(page.has_more);
     bookmarkOffsetRef.current = page.items.length;
-    setBookmarkTotal(total);
     setStatus(syncStatus);
     setHasToken(tokenPresent);
+    syncLog("loadState done", {
+      items: page.items.length,
+      hasMore: page.has_more,
+      tokenPresent,
+      syncStatus,
+    });
   }
 
   async function loadMore() {
     if (isLoadingMore) return;
+    syncLog("loadMore start", { offset: bookmarkOffsetRef.current });
     setIsLoadingMore(true);
     try {
       const currentOffset = bookmarkOffsetRef.current;
@@ -338,7 +378,13 @@ function App() {
         const nextPage = page.items.filter((bm) => !seen.has(bm.href_norm));
         return nextPage.length > 0 ? [...prev, ...nextPage] : prev;
       });
+      setHasMoreBookmarks(page.has_more);
       bookmarkOffsetRef.current = currentOffset + page.items.length;
+      syncLog("loadMore done", {
+        fetched: page.items.length,
+        hasMore: page.has_more,
+        nextOffset: bookmarkOffsetRef.current,
+      });
     } finally {
       setIsLoadingMore(false);
     }
@@ -350,16 +396,29 @@ function App() {
     setIsSubmittingToken(true);
     try {
       const token = tokenInput.trim();
-      await writeStoredToken(token);
+      // Backend first — instant, no vault overhead — UI transitions immediately
       await invoke("set_api_token", { token });
+      syncLog("set_api_token completed");
+      setHasToken(true);
       setTokenInput("");
-      // Immediately update UI state so the main view shows
-      await loadState();
-      // Kick off sync in the background — don't block on it
+      // Vault write is fire-and-forget — never blocks the UI
+      writeStoredToken(token).catch((err) => {
+        console.error("[pinboarder-stronghold] background writeStoredToken failed, using localStorage fallback:", err);
+        window.localStorage.setItem("pinboarder_token_fallback", token);
+      });
+      // Hydrate UI and sync in background; don't block setup transition.
+      loadState().catch(console.error);
       setIsSyncing(true);
+      syncLog("sync_now after token set start");
       invoke("sync_now")
-        .then(() => loadState())
-        .catch(console.error)
+        .then(() => {
+          syncLog("sync_now after token set success");
+          return loadState();
+        })
+        .catch((err) => {
+          syncLog("sync_now after token set failed", err);
+          console.error(err);
+        })
         .finally(() => setIsSyncing(false));
     } finally {
       setIsSubmittingToken(false);
@@ -370,16 +429,18 @@ function App() {
     if (metaFetchTimer.current) clearTimeout(metaFetchTimer.current);
     const normalized = url.includes("://") ? url : `https://${url}`;
     try { new URL(normalized); } catch { return; } // not a valid URL yet
+    const gen = ++metaFetchGen.current;
     metaFetchTimer.current = setTimeout(async () => {
       setIsFetchingMeta(true);
       try {
         const meta = await invoke<{ title: string; tags: string[] }>("fetch_page_meta", { url: normalized });
+        if (gen !== metaFetchGen.current) return; // form was submitted/cleared, discard
         if (meta.title) setAddTitle(meta.title);
         if (meta.tags.length > 0) setAddTags(meta.tags);
       } catch {
         // silently ignore — user can fill in manually
       } finally {
-        setIsFetchingMeta(false);
+        if (gen === metaFetchGen.current) setIsFetchingMeta(false);
       }
     }, 700);
   }, []);
@@ -399,7 +460,9 @@ function App() {
     if (!addUrl.trim()) return;
     setIsAdding(true);
     setAddStatus("saving");
-    if (savedTimer.current) clearTimeout(savedTimer.current);
+    if (metaFetchTimer.current) clearTimeout(metaFetchTimer.current);
+    metaFetchGen.current++; // invalidate any in-flight fetch_page_meta
+    setIsFetchingMeta(false);
     try {
       const newUrl = normalizeUrl(addUrl.trim());
       // If editing and the URL changed, delete the old bookmark first
@@ -415,11 +478,11 @@ function App() {
       setAddTitle("");
       setAddTags([]);
       setTagInput("");
-      const wasEditing = !!editingHref;
       setEditingHref(null);
-      setAddStatus("saved");
-      savedTimer.current = setTimeout(() => setAddStatus("idle"), wasEditing ? 0 : 2000);
       await loadState();
+      setAddStatus("saved");
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+      savedTimer.current = setTimeout(() => setAddStatus("idle"), 700);
     } catch {
       setAddStatus("idle");
     } finally {
@@ -430,33 +493,72 @@ function App() {
   async function handleSync() {
     setMenuOpen(false);
     setIsSyncing(true);
+    syncLog("manual sync_now start");
     try {
       await invoke("sync_now");
-      await loadState();
+      syncLog("manual sync_now success");
+      invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
+    } catch (err) {
+      syncLog("manual sync_now failed", err);
+      console.error("sync_now failed", err);
     } finally {
+      await loadState().catch(console.error);
       setIsSyncing(false);
+      syncLog("manual sync_now done");
     }
   }
 
   async function handleResetToken() {
     setMenuOpen(false);
-    await clearStoredToken();
+    // Fire vault clear in background — never block UI state reset
+    clearStoredToken().catch((err) =>
+      console.error("[pinboarder-stronghold] clearStoredToken background error:", err)
+    );
     await invoke("clear_api_token");
     setHasToken(false);
     setBookmarks([]);
+    setHasMoreBookmarks(false);
     setStatus(null);
+    setAddUrl("");
+    setAddTitle("");
+    setAddTags([]);
+    setTagInput("");
+    setTagSuggestionsOpen(false);
+    setAddStatus("idle");
+    setEditingHref(null);
+    setIsAdding(false);
+    setIsFetchingMeta(false);
   }
 
   useEffect(() => {
     let active = true;
-    invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
     (async () => {
       const token = await readStoredToken();
+      syncLog("startup readStoredToken", { hasToken: !!token });
       if (active && token) {
         await invoke("set_api_token", { token });
+        syncLog("startup set_api_token from local store success");
+        invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
       }
       if (active) {
         await loadState();
+        // Always attempt a sync on app load when token exists.
+        const has = await invoke<boolean>("has_api_token").catch(() => false);
+        if (has) {
+          setIsSyncing(true);
+          syncLog("startup sync_now start");
+          invoke("sync_now")
+            .catch((err) => {
+              syncLog("startup sync_now failed", err);
+              console.error("startup sync_now failed", err);
+            })
+            .finally(() => {
+              loadState().catch(console.error);
+              invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
+              if (active) setIsSyncing(false);
+              syncLog("startup sync_now done");
+            });
+        }
       }
     })().catch(console.error);
     const openUnlisten = listen<OpenUrlEvent>("open-url", (e) => {
@@ -464,7 +566,10 @@ function App() {
         openUrl(e.payload.url);
       }
     });
-    const recentUnlisten = listen("recent-updated", () => loadState());
+    const recentUnlisten = listen("recent-updated", () => {
+      syncLog("event recent-updated received");
+      return loadState();
+    });
     return () => {
       active = false;
       openUnlisten.then((f) => f());
@@ -558,7 +663,7 @@ function App() {
               type="submit"
               disabled={isSubmittingToken || !tokenInput.trim()}
             >
-              {isSubmittingToken ? "Connecting…" : "Connect"}
+              {isSubmittingToken ? <>Connecting<LoadingDots /></> : "Connect"}
             </button>
           </form>
           <button
@@ -581,96 +686,115 @@ function App() {
               placeholder="Paste URL..."
               value={addUrl}
               onChange={(e) => {
-                setAddUrl(e.currentTarget.value);
-                if (hasBookmarks) fetchMetaForUrl(e.currentTarget.value);
+                const val = e.currentTarget.value;
+                setAddUrl(val);
+                if (!val.trim()) {
+                  if (metaFetchTimer.current) clearTimeout(metaFetchTimer.current);
+                  metaFetchGen.current++;
+                  setIsFetchingMeta(false);
+                  setAddTitle("");
+                  setAddTags([]);
+                } else if (hasBookmarks && !editingHref) {
+                  fetchMetaForUrl(val);
+                }
               }}
               spellCheck={false}
               autoCorrect="off"
               autoCapitalize="none"
             />
-            {hasBookmarks && (
-              <>
+            <input
+              className="add-input"
+              placeholder={isFetchingMeta ? "Fetching title…" : "Title"}
+              value={addTitle}
+              onChange={(e) => setAddTitle(e.currentTarget.value)}
+              spellCheck={false}
+            />
+            <div className="tag-field-wrap">
+              <div className="tag-field">
+                {addTags.map((tag) => (
+                  <span className="tag-chip" key={tag}>
+                    {tag}
+                    <button
+                      type="button"
+                      className="tag-chip-remove"
+                      onClick={() => setAddTags((t) => t.filter((x) => x !== tag))}
+                    >×</button>
+                  </span>
+                ))}
                 <input
-                  className="add-input"
-                  placeholder={isFetchingMeta ? "Fetching title…" : "Title"}
-                  value={addTitle}
-                  onChange={(e) => setAddTitle(e.currentTarget.value)}
+                  className="tag-chip-input"
+                  placeholder={addTags.length === 0 ? "Add tag…" : ""}
+                  value={tagInput}
+                  onChange={(e) => {
+                    setTagInput(e.currentTarget.value);
+                    setTagSuggestionsOpen(true);
+                  }}
+                  onFocus={() => setTagSuggestionsOpen(true)}
+                  onBlur={() => setTimeout(() => setTagSuggestionsOpen(false), 150)}
+                  onKeyDown={(e) => {
+                    if ((e.key === "Enter" || e.key === "," || e.key === " ") && tagInput.trim()) {
+                      e.preventDefault();
+                      const t = tagInput.trim().replace(/,$/, "");
+                      if (t && !addTags.includes(t)) setAddTags((prev) => [...prev, t]);
+                      setTagInput("");
+                    } else if (e.key === "Backspace" && !tagInput && addTags.length > 0) {
+                      setAddTags((prev) => prev.slice(0, -1));
+                    }
+                  }}
                   spellCheck={false}
                 />
-                <div className="tag-field-wrap">
-                  <div className="tag-field">
-                    {addTags.map((tag) => (
-                      <span className="tag-chip" key={tag}>
-                        {tag}
-                        <button
-                          type="button"
-                          className="tag-chip-remove"
-                          onClick={() => setAddTags((t) => t.filter((x) => x !== tag))}
-                        >×</button>
-                      </span>
-                    ))}
-                    <input
-                      className="tag-chip-input"
-                      placeholder={addTags.length === 0 ? "Add tag…" : ""}
-                      value={tagInput}
-                      onChange={(e) => {
-                        setTagInput(e.currentTarget.value);
-                        setTagSuggestionsOpen(true);
-                      }}
-                      onFocus={() => setTagSuggestionsOpen(true)}
-                      onBlur={() => setTimeout(() => setTagSuggestionsOpen(false), 150)}
-                      onKeyDown={(e) => {
-                        if ((e.key === "Enter" || e.key === "," || e.key === " ") && tagInput.trim()) {
+              </div>
+              {tagSuggestionsOpen && (() => {
+                const q = tagInput.toLowerCase();
+                const suggestions = userTags
+                  .filter((t) => !addTags.includes(t) && (!q || t.toLowerCase().startsWith(q)))
+                  .slice(0, 6);
+                if (suggestions.length === 0) return null;
+                return (
+                  <div className="tag-suggestions">
+                    {suggestions.map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        className="tag-suggestion"
+                        onMouseDown={(e) => {
                           e.preventDefault();
-                          const t = tagInput.trim().replace(/,$/, "");
-                          if (t && !addTags.includes(t)) setAddTags((prev) => [...prev, t]);
+                          setAddTags((prev) => [...prev, t]);
                           setTagInput("");
-                        } else if (e.key === "Backspace" && !tagInput && addTags.length > 0) {
-                          setAddTags((prev) => prev.slice(0, -1));
-                        }
-                      }}
-                      spellCheck={false}
-                    />
+                        }}
+                      >{t}</button>
+                    ))}
                   </div>
-                  {tagSuggestionsOpen && (() => {
-                    const q = tagInput.toLowerCase();
-                    const suggestions = userTags
-                      .filter((t) => !addTags.includes(t) && (!q || t.toLowerCase().startsWith(q)))
-                      .slice(0, 6);
-                    if (suggestions.length === 0) return null;
-                    return (
-                      <div className="tag-suggestions">
-                        {suggestions.map((t) => (
-                          <button
-                            key={t}
-                            type="button"
-                            className="tag-suggestion"
-                            onMouseDown={(e) => {
-                              e.preventDefault();
-                              setAddTags((prev) => [...prev, t]);
-                              setTagInput("");
-                            }}
-                          >{t}</button>
-                        ))}
-                      </div>
-                    );
-                  })()}
-                </div>
-              </>
-            )}
+                );
+              })()}
+            </div>
             <div className="add-actions">
-              {addStatus === "saving" && (
-                <span className="add-status add-status-saving">saving…</span>
-              )}
-              {addStatus === "saved" && (
-                <span className="add-status add-status-saved">saved ✓</span>
+              {editingHref && (
+                <button
+                  className="btn-cancel-edit"
+                  type="button"
+                  onClick={() => {
+                    setEditingHref(null);
+                    setAddUrl("");
+                    setAddTitle("");
+                    setAddTags([]);
+                    setTagInput("");
+                    setAddStatus("idle");
+                  }}
+                >
+                  Cancel
+                </button>
               )}
               <button
-                className="btn-add"
+                className={`btn-add${addStatus === "saved" ? " btn-add-saved" : ""}`}
                 type="submit"
                 disabled={isAdding || !addUrl.trim()}
               >
-                {editingHref ? "↓ Save" : "+ Add"}
+                {isAdding
+                  ? <>{editingHref ? "↓ Save" : "+ Add"}<LoadingDots /></>
+                  : addStatus === "saved"
+                    ? "✓ Saved"
+                    : editingHref ? "↓ Save" : "+ Add"}
               </button>
             </div>
           </form>
@@ -678,15 +802,17 @@ function App() {
           {/* List header */}
           <div className="list-header">
             <span>Recent</span>
+            {isSyncing && <span className="list-header-syncing">syncing<LoadingDots /></span>}
           </div>
 
           {/* Bookmarks or empty */}
           {hasBookmarks ? (
             <div className="bookmark-list">
-              {bookmarks.map((bm) => (
+              {bookmarks.map((bm, i) => (
                 <BookmarkRow
                   bookmark={bm}
                   key={bm.href_norm}
+                  animationDelay={Math.min(i * 40, 240)}
                   onDelete={async (href) => {
                     await invoke("delete_bookmark", { href });
                     await loadState();
@@ -694,13 +820,13 @@ function App() {
                   onEdit={handleEditBookmark}
                 />
               ))}
-              {bookmarks.length < bookmarkTotal && (
+              {hasMoreBookmarks && (
                 <button
                   className="load-more"
                   onClick={loadMore}
                   disabled={isLoadingMore}
                 >
-                  {isLoadingMore ? "loading…" : "load more"}
+                  {isLoadingMore ? <>loading<LoadingDots /></> : "load more"}
                 </button>
               )}
             </div>
@@ -708,9 +834,6 @@ function App() {
             <div className="empty-state">
               <p className="empty-hint">
                 Add your first link above or wait for sync.
-              </p>
-              <p className="empty-tip">
-                <kbd>⌘V</kbd> to paste a URL
               </p>
             </div>
           )}

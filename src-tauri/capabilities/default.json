@@ -7,6 +7,13 @@
     "core:default",
     "opener:allow-open-url",
     "opener:allow-default-urls",
-    "stronghold:default"
+    "core:path:default",
+    "stronghold:allow-initialize",
+    "stronghold:allow-create-client",
+    "stronghold:allow-load-client",
+    "stronghold:allow-save",
+    "stronghold:allow-get-store-record",
+    "stronghold:allow-save-store-record",
+    "stronghold:allow-remove-store-record"
   ]
 }
