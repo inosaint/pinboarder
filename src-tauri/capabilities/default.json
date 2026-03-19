@@ -6,7 +6,6 @@
   "permissions": [
     "core:default",
     "opener:allow-open-url",
-    "opener:allow-default-urls",
-    "stronghold:default"
+    "opener:allow-default-urls"
   ]
 }

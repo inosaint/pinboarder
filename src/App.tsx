@@ -1,9 +1,7 @@
 import { FormEvent, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { appDataDir } from "@tauri-apps/api/path";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { Stronghold } from "@tauri-apps/plugin-stronghold";
 import "./App.css";
 
 type Bookmark = {
@@ -30,43 +28,26 @@ type OpenUrlEvent = { url: string };
 
 const STRONGHOLD_CLIENT_NAME = "pinboarder";
 const STRONGHOLD_TOKEN_KEY = "pinboard_api_token";
-const STRONGHOLD_PASSWORD = "pinboarder-stronghold-v1";
-
-async function getStrongholdStore() {
-  const vaultPath = `${await appDataDir()}pinboarder.vault.hold`;
-  const stronghold = await Stronghold.load(vaultPath, STRONGHOLD_PASSWORD);
-  let client;
-  try {
-    client = await stronghold.loadClient(STRONGHOLD_CLIENT_NAME);
-  } catch {
-    client = await stronghold.createClient(STRONGHOLD_CLIENT_NAME);
-  }
-  return { stronghold, store: client.getStore() };
-}
+const LOCAL_TOKEN_KEY = `${STRONGHOLD_CLIENT_NAME}:${STRONGHOLD_TOKEN_KEY}`;
 
 async function readStoredToken(): Promise<string | null> {
   try {
-    const { store } = await getStrongholdStore();
-    const bytes = await store.get(STRONGHOLD_TOKEN_KEY);
-    if (!bytes || bytes.length === 0) return null;
-    return new TextDecoder().decode(new Uint8Array(bytes)).trim() || null;
+    // Stronghold intentionally disabled for now; use local persisted token copy.
+    const token = window.localStorage.getItem(LOCAL_TOKEN_KEY);
+    return token?.trim() || null;
   } catch {
     return null;
   }
 }
 
 async function writeStoredToken(token: string): Promise<void> {
-  const { stronghold, store } = await getStrongholdStore();
-  const bytes = Array.from(new TextEncoder().encode(token));
-  await store.insert(STRONGHOLD_TOKEN_KEY, bytes);
-  await stronghold.save();
+  // Stronghold intentionally disabled for now; use local persisted token copy.
+  window.localStorage.setItem(LOCAL_TOKEN_KEY, token);
 }
 
 async function clearStoredToken(): Promise<void> {
   try {
-    const { stronghold, store } = await getStrongholdStore();
-    await store.remove(STRONGHOLD_TOKEN_KEY);
-    await stronghold.save();
+    window.localStorage.removeItem(LOCAL_TOKEN_KEY);
   } catch {
     // ignore cleanup failures, app state is still cleared
   }
@@ -113,19 +94,12 @@ function formatElapsedSync(secondsAgo: number): string {
   return "just now";
 }
 
-function TagDots({ tags }: { tags: string }) {
-  const count = tags
-    .split(/[,\s]+/)
-    .map((x) => x.trim())
-    .filter(Boolean).length;
-  if (count === 0) return null;
-  return (
-    <div className="tag-dots">
-      {Array.from({ length: Math.min(count, 8) }).map((_, i) => (
-        <span className="tag-dot" key={i} />
-      ))}
-    </div>
-  );
+function syncLog(message: string, extra?: unknown) {
+  if (extra !== undefined) {
+    console.log(`[pinboarder-sync-ui] ${message}`, extra);
+    return;
+  }
+  console.log(`[pinboarder-sync-ui] ${message}`);
 }
 
 function BookmarkRow({
@@ -269,7 +243,7 @@ const PAGE_SIZE = 25;
 function App() {
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const bookmarkOffsetRef = useRef(PAGE_SIZE);
-  const [bookmarkTotal, setBookmarkTotal] = useState(0);
+  const [hasMoreBookmarks, setHasMoreBookmarks] = useState(false);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [userTags, setUserTags] = useState<string[]>([]);
   const [status, setStatus] = useState<SyncStatus | null>(null);
@@ -311,21 +285,28 @@ function App() {
   }, [isSyncing, status]);
 
   async function loadState() {
-    const [page, syncStatus, tokenPresent, total] = await Promise.all([
+    syncLog("loadState start");
+    const [page, syncStatus, tokenPresent] = await Promise.all([
       invoke<BookmarkPage>("get_recent_bookmarks_page", { limit: PAGE_SIZE, offset: 0 }),
       invoke<SyncStatus>("get_sync_status"),
       invoke<boolean>("has_api_token"),
-      invoke<number>("get_bookmark_count"),
     ]);
     setBookmarks(page.items);
+    setHasMoreBookmarks(page.has_more);
     bookmarkOffsetRef.current = page.items.length;
-    setBookmarkTotal(total);
     setStatus(syncStatus);
     setHasToken(tokenPresent);
+    syncLog("loadState done", {
+      items: page.items.length,
+      hasMore: page.has_more,
+      tokenPresent,
+      syncStatus,
+    });
   }
 
   async function loadMore() {
     if (isLoadingMore) return;
+    syncLog("loadMore start", { offset: bookmarkOffsetRef.current });
     setIsLoadingMore(true);
     try {
       const currentOffset = bookmarkOffsetRef.current;
@@ -338,7 +319,13 @@ function App() {
         const nextPage = page.items.filter((bm) => !seen.has(bm.href_norm));
         return nextPage.length > 0 ? [...prev, ...nextPage] : prev;
       });
+      setHasMoreBookmarks(page.has_more);
       bookmarkOffsetRef.current = currentOffset + page.items.length;
+      syncLog("loadMore done", {
+        fetched: page.items.length,
+        hasMore: page.has_more,
+        nextOffset: bookmarkOffsetRef.current,
+      });
     } finally {
       setIsLoadingMore(false);
     }
@@ -352,14 +339,22 @@ function App() {
       const token = tokenInput.trim();
       await writeStoredToken(token);
       await invoke("set_api_token", { token });
+      syncLog("set_api_token completed");
+      setHasToken(true);
       setTokenInput("");
-      // Immediately update UI state so the main view shows
-      await loadState();
-      // Kick off sync in the background — don't block on it
+      // Hydrate UI and sync in background; don't block setup transition.
+      loadState().catch(console.error);
       setIsSyncing(true);
+      syncLog("sync_now after token set start");
       invoke("sync_now")
-        .then(() => loadState())
-        .catch(console.error)
+        .then(() => {
+          syncLog("sync_now after token set success");
+          return loadState();
+        })
+        .catch((err) => {
+          syncLog("sync_now after token set failed", err);
+          console.error(err);
+        })
         .finally(() => setIsSyncing(false));
     } finally {
       setIsSubmittingToken(false);
@@ -430,11 +425,17 @@ function App() {
   async function handleSync() {
     setMenuOpen(false);
     setIsSyncing(true);
+    syncLog("manual sync_now start");
     try {
       await invoke("sync_now");
-      await loadState();
+      syncLog("manual sync_now success");
+    } catch (err) {
+      syncLog("manual sync_now failed", err);
+      console.error("sync_now failed", err);
     } finally {
+      await loadState().catch(console.error);
       setIsSyncing(false);
+      syncLog("manual sync_now done");
     }
   }
 
@@ -444,7 +445,17 @@ function App() {
     await invoke("clear_api_token");
     setHasToken(false);
     setBookmarks([]);
+    setHasMoreBookmarks(false);
     setStatus(null);
+    setAddUrl("");
+    setAddTitle("");
+    setAddTags([]);
+    setTagInput("");
+    setTagSuggestionsOpen(false);
+    setAddStatus("idle");
+    setEditingHref(null);
+    setIsAdding(false);
+    setIsFetchingMeta(false);
   }
 
   useEffect(() => {
@@ -452,11 +463,29 @@ function App() {
     invoke<string[]>("get_user_tags").then(setUserTags).catch(() => {});
     (async () => {
       const token = await readStoredToken();
+      syncLog("startup readStoredToken", { hasToken: !!token });
       if (active && token) {
         await invoke("set_api_token", { token });
+        syncLog("startup set_api_token from local store success");
       }
       if (active) {
         await loadState();
+        // Always attempt a sync on app load when token exists.
+        const has = await invoke<boolean>("has_api_token").catch(() => false);
+        if (has) {
+          setIsSyncing(true);
+          syncLog("startup sync_now start");
+          invoke("sync_now")
+            .catch((err) => {
+              syncLog("startup sync_now failed", err);
+              console.error("startup sync_now failed", err);
+            })
+            .finally(() => {
+              loadState().catch(console.error);
+              if (active) setIsSyncing(false);
+              syncLog("startup sync_now done");
+            });
+        }
       }
     })().catch(console.error);
     const openUnlisten = listen<OpenUrlEvent>("open-url", (e) => {
@@ -464,7 +493,10 @@ function App() {
         openUrl(e.payload.url);
       }
     });
-    const recentUnlisten = listen("recent-updated", () => loadState());
+    const recentUnlisten = listen("recent-updated", () => {
+      syncLog("event recent-updated received");
+      return loadState();
+    });
     return () => {
       active = false;
       openUnlisten.then((f) => f());
@@ -582,83 +614,97 @@ function App() {
               value={addUrl}
               onChange={(e) => {
                 setAddUrl(e.currentTarget.value);
-                if (hasBookmarks) fetchMetaForUrl(e.currentTarget.value);
+                if (hasBookmarks && !editingHref) {
+                  fetchMetaForUrl(e.currentTarget.value);
+                }
               }}
               spellCheck={false}
               autoCorrect="off"
               autoCapitalize="none"
             />
-            {hasBookmarks && (
-              <>
+            <input
+              className="add-input"
+              placeholder={isFetchingMeta ? "Fetching title…" : "Title"}
+              value={addTitle}
+              onChange={(e) => setAddTitle(e.currentTarget.value)}
+              spellCheck={false}
+            />
+            <div className="tag-field-wrap">
+              <div className="tag-field">
+                {addTags.map((tag) => (
+                  <span className="tag-chip" key={tag}>
+                    {tag}
+                    <button
+                      type="button"
+                      className="tag-chip-remove"
+                      onClick={() => setAddTags((t) => t.filter((x) => x !== tag))}
+                    >×</button>
+                  </span>
+                ))}
                 <input
-                  className="add-input"
-                  placeholder={isFetchingMeta ? "Fetching title…" : "Title"}
-                  value={addTitle}
-                  onChange={(e) => setAddTitle(e.currentTarget.value)}
+                  className="tag-chip-input"
+                  placeholder={addTags.length === 0 ? "Add tag…" : ""}
+                  value={tagInput}
+                  onChange={(e) => {
+                    setTagInput(e.currentTarget.value);
+                    setTagSuggestionsOpen(true);
+                  }}
+                  onFocus={() => setTagSuggestionsOpen(true)}
+                  onBlur={() => setTimeout(() => setTagSuggestionsOpen(false), 150)}
+                  onKeyDown={(e) => {
+                    if ((e.key === "Enter" || e.key === "," || e.key === " ") && tagInput.trim()) {
+                      e.preventDefault();
+                      const t = tagInput.trim().replace(/,$/, "");
+                      if (t && !addTags.includes(t)) setAddTags((prev) => [...prev, t]);
+                      setTagInput("");
+                    } else if (e.key === "Backspace" && !tagInput && addTags.length > 0) {
+                      setAddTags((prev) => prev.slice(0, -1));
+                    }
+                  }}
                   spellCheck={false}
                 />
-                <div className="tag-field-wrap">
-                  <div className="tag-field">
-                    {addTags.map((tag) => (
-                      <span className="tag-chip" key={tag}>
-                        {tag}
-                        <button
-                          type="button"
-                          className="tag-chip-remove"
-                          onClick={() => setAddTags((t) => t.filter((x) => x !== tag))}
-                        >×</button>
-                      </span>
-                    ))}
-                    <input
-                      className="tag-chip-input"
-                      placeholder={addTags.length === 0 ? "Add tag…" : ""}
-                      value={tagInput}
-                      onChange={(e) => {
-                        setTagInput(e.currentTarget.value);
-                        setTagSuggestionsOpen(true);
-                      }}
-                      onFocus={() => setTagSuggestionsOpen(true)}
-                      onBlur={() => setTimeout(() => setTagSuggestionsOpen(false), 150)}
-                      onKeyDown={(e) => {
-                        if ((e.key === "Enter" || e.key === "," || e.key === " ") && tagInput.trim()) {
+              </div>
+              {tagSuggestionsOpen && (() => {
+                const q = tagInput.toLowerCase();
+                const suggestions = userTags
+                  .filter((t) => !addTags.includes(t) && (!q || t.toLowerCase().startsWith(q)))
+                  .slice(0, 6);
+                if (suggestions.length === 0) return null;
+                return (
+                  <div className="tag-suggestions">
+                    {suggestions.map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        className="tag-suggestion"
+                        onMouseDown={(e) => {
                           e.preventDefault();
-                          const t = tagInput.trim().replace(/,$/, "");
-                          if (t && !addTags.includes(t)) setAddTags((prev) => [...prev, t]);
+                          setAddTags((prev) => [...prev, t]);
                           setTagInput("");
-                        } else if (e.key === "Backspace" && !tagInput && addTags.length > 0) {
-                          setAddTags((prev) => prev.slice(0, -1));
-                        }
-                      }}
-                      spellCheck={false}
-                    />
+                        }}
+                      >{t}</button>
+                    ))}
                   </div>
-                  {tagSuggestionsOpen && (() => {
-                    const q = tagInput.toLowerCase();
-                    const suggestions = userTags
-                      .filter((t) => !addTags.includes(t) && (!q || t.toLowerCase().startsWith(q)))
-                      .slice(0, 6);
-                    if (suggestions.length === 0) return null;
-                    return (
-                      <div className="tag-suggestions">
-                        {suggestions.map((t) => (
-                          <button
-                            key={t}
-                            type="button"
-                            className="tag-suggestion"
-                            onMouseDown={(e) => {
-                              e.preventDefault();
-                              setAddTags((prev) => [...prev, t]);
-                              setTagInput("");
-                            }}
-                          >{t}</button>
-                        ))}
-                      </div>
-                    );
-                  })()}
-                </div>
-              </>
-            )}
+                );
+              })()}
+            </div>
             <div className="add-actions">
+              {editingHref && (
+                <button
+                  className="btn-cancel-edit"
+                  type="button"
+                  onClick={() => {
+                    setEditingHref(null);
+                    setAddUrl("");
+                    setAddTitle("");
+                    setAddTags([]);
+                    setTagInput("");
+                    setAddStatus("idle");
+                  }}
+                >
+                  Cancel
+                </button>
+              )}
               {addStatus === "saving" && (
                 <span className="add-status add-status-saving">saving…</span>
               )}
@@ -694,7 +740,7 @@ function App() {
                   onEdit={handleEditBookmark}
                 />
               ))}
-              {bookmarks.length < bookmarkTotal && (
+              {hasMoreBookmarks && (
                 <button
                   className="load-more"
                   onClick={loadMore}
@@ -708,9 +754,6 @@ function App() {
             <div className="empty-state">
               <p className="empty-hint">
                 Add your first link above or wait for sync.
-              </p>
-              <p className="empty-tip">
-                <kbd>⌘V</kbd> to paste a URL
               </p>
             </div>
           )}

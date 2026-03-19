@@ -360,26 +360,25 @@ body {
 }
 
 .btn-primary {
-  padding: 9px 16px;
-  font-size: 12px;
+  padding: 6px 16px;
+  font-size: 11px;
   font-weight: 700;
   font-family: var(--font-sans);
-  background: var(--ink);
+  background: var(--red);
   color: #fff;
-  border: 1.5px solid var(--ink);
-  border-radius: 6px;
+  border: none;
+  border-radius: 5px;
   cursor: pointer;
   flex-shrink: 0;
-  transition: background 0.12s, border-color 0.12s;
+  transition: background 0.12s;
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--red);
-  border-color: var(--red);
+  background: var(--ink);
 }
 
 .btn-primary:disabled {
-  opacity: 0.45;
+  opacity: 0.35;
   cursor: not-allowed;
 }
 
@@ -552,6 +551,33 @@ body {
   gap: 8px;
 }
 
+.btn-cancel-edit {
+  margin-right: auto;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid rgba(0, 0, 0, 0.22);
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 5px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+
+.btn-cancel-edit:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(255, 59, 17, 0.04);
+}
+
 .add-status {
   font-family: var(--font-mono);
   font-size: 10px;
@@ -638,7 +664,7 @@ body {
   padding: 9px 14px;
   font-family: var(--font-mono);
   font-size: 10px;
-  color: var(--ink-muted);
+  color: var(--red);
   cursor: pointer;
   text-align: left;
   transition: color 0.12s;
