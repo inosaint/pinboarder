@@ -215,6 +215,14 @@ function BookmarkRow({
     return () => document.removeEventListener("mousedown", handler);
   }, [menuOpen]);
 
+  useEffect(() => {
+    if (!menuOpen) return;
+    const id = setTimeout(() => {
+      menuRef.current?.querySelector<HTMLButtonElement>(".bm-row-menu-item:not(:disabled)")?.focus();
+    }, 0);
+    return () => clearTimeout(id);
+  }, [menuOpen]);
+
   return (
     <div
       role="link"
@@ -227,7 +235,9 @@ function BookmarkRow({
         }
       }}
       onKeyDown={(e) => {
-        if (e.key === "Enter" && !deleting && canOpenExternalUrl(bookmark.href)) {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+        } else if (e.key === "Enter" && e.target === e.currentTarget && !deleting && canOpenExternalUrl(bookmark.href)) {
           openUrl(bookmark.href);
         }
       }}
@@ -244,6 +254,11 @@ function BookmarkRow({
           ref={menuRef}
           data-open={menuOpen ? "true" : "false"}
           onClick={(e) => e.stopPropagation()}
+          onBlur={(e) => {
+            if (!menuRef.current?.contains(e.relatedTarget as Node)) {
+              setMenuOpen(false);
+            }
+          }}
         >
           <button
             ref={btnRef}
@@ -270,6 +285,18 @@ function BookmarkRow({
             <div
               className="bm-row-menu"
               style={{ position: "fixed", ...menuPos }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setMenuOpen(false);
+                  btnRef.current?.focus();
+                } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                  e.preventDefault();
+                  const items = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>(".bm-row-menu-item:not(:disabled)"));
+                  const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+                  const next = e.key === "ArrowDown" ? Math.min(idx + 1, items.length - 1) : Math.max(idx - 1, 0);
+                  items[next]?.focus();
+                }
+              }}
             >
               <button className="bm-row-menu-item" onClick={handleEdit}>
                 Edit
@@ -309,6 +336,7 @@ function App() {
   const [isSyncing, setIsSyncing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const iconBtnRef = useRef<HTMLButtonElement>(null);
 
   // Setup form
   const [tokenInput, setTokenInput] = useState("");
@@ -321,6 +349,11 @@ function App() {
   const [addTags, setAddTags] = useState<string[]>([]);
   const [tagInput, setTagInput] = useState("");
   const [tagSuggestionsOpen, setTagSuggestionsOpen] = useState(false);
+  const [highlightedTagIndex, setHighlightedTagIndex] = useState(-1);
+  const [recentTags, setRecentTags] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("pinboarder_recent_tags") || "[]"); }
+    catch { return []; }
+  });
   const [isAdding, setIsAdding] = useState(false);
   const [addStatus, setAddStatus] = useState<"idle" | "saving" | "saved">("idle");
   const [isFetchingMeta, setIsFetchingMeta] = useState(false);
@@ -474,6 +507,11 @@ function App() {
         title: addTitle.trim() || extractDomain(addUrl.trim()),
         tags: addTags.join(", "),
       });
+      if (addTags.length > 0) {
+        const updated = [...new Set([...addTags, ...recentTags])].slice(0, 3);
+        setRecentTags(updated);
+        localStorage.setItem("pinboarder_recent_tags", JSON.stringify(updated));
+      }
       setAddUrl("");
       setAddTitle("");
       setAddTags([]);
@@ -589,6 +627,15 @@ function App() {
     return () => document.removeEventListener("mousedown", handler);
   }, [menuOpen]);
 
+  // Focus first dropdown item when header menu opens
+  useEffect(() => {
+    if (!menuOpen) return;
+    const id = setTimeout(() => {
+      menuRef.current?.querySelector<HTMLButtonElement>(".dropdown-item:not(:disabled)")?.focus();
+    }, 0);
+    return () => clearTimeout(id);
+  }, [menuOpen]);
+
   return (
     <div className="panel-root">
     <div className="panel-nub" />
@@ -608,8 +655,17 @@ function App() {
               <span className="sync-dot" />
               <span className="sync-label">{syncInfo.label}</span>
             </div>
-            <div className="menu-wrap" ref={menuRef}>
+            <div
+              className="menu-wrap"
+              ref={menuRef}
+              onBlur={(e) => {
+                if (!menuRef.current?.contains(e.relatedTarget as Node)) {
+                  setMenuOpen(false);
+                }
+              }}
+            >
               <button
+                ref={iconBtnRef}
                 className="icon-btn"
                 onClick={() => setMenuOpen((v) => !v)}
                 title="Options"
@@ -617,7 +673,21 @@ function App() {
                 <span className="dots">•••</span>
               </button>
               {menuOpen && (
-                <div className="dropdown">
+                <div
+                  className="dropdown"
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      setMenuOpen(false);
+                      iconBtnRef.current?.focus();
+                    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+                      e.preventDefault();
+                      const items = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>(".dropdown-item:not(:disabled)"));
+                      const idx = items.indexOf(document.activeElement as HTMLButtonElement);
+                      const next = e.key === "ArrowDown" ? Math.min(idx + 1, items.length - 1) : Math.max(idx - 1, 0);
+                      items[next]?.focus();
+                    }
+                  }}
+                >
                   <button
                     className="dropdown-item"
                     onClick={handleSync}
@@ -728,11 +798,39 @@ function App() {
                   onChange={(e) => {
                     setTagInput(e.currentTarget.value);
                     setTagSuggestionsOpen(true);
+                    setHighlightedTagIndex(-1);
                   }}
                   onFocus={() => setTagSuggestionsOpen(true)}
-                  onBlur={() => setTimeout(() => setTagSuggestionsOpen(false), 150)}
+                  onBlur={() => setTimeout(() => { setTagSuggestionsOpen(false); setHighlightedTagIndex(-1); }, 150)}
                   onKeyDown={(e) => {
-                    if ((e.key === "Enter" || e.key === "," || e.key === " ") && tagInput.trim()) {
+                    const q = tagInput.toLowerCase();
+                    const recentMatches = recentTags
+                      .filter((t) => !addTags.includes(t) && (!q || t.toLowerCase().startsWith(q)))
+                      .slice(0, 3);
+                    const otherSuggestions = userTags
+                      .filter((t) => !addTags.includes(t) && !recentMatches.includes(t) && (!q || t.toLowerCase().startsWith(q)))
+                      .slice(0, Math.max(0, 6 - recentMatches.length));
+                    const allSuggestions = [...recentMatches, ...otherSuggestions];
+
+                    if (e.key === "ArrowDown" && tagSuggestionsOpen && allSuggestions.length > 0) {
+                      e.preventDefault();
+                      setHighlightedTagIndex((i) => Math.min(i + 1, allSuggestions.length - 1));
+                    } else if (e.key === "ArrowUp" && tagSuggestionsOpen && allSuggestions.length > 0) {
+                      e.preventDefault();
+                      setHighlightedTagIndex((i) => Math.max(i - 1, 0));
+                    } else if (e.key === "Enter" && highlightedTagIndex >= 0 && allSuggestions[highlightedTagIndex]) {
+                      e.preventDefault();
+                      const t = allSuggestions[highlightedTagIndex];
+                      if (!addTags.includes(t)) setAddTags((prev) => [...prev, t]);
+                      setTagInput("");
+                      setHighlightedTagIndex(-1);
+                    } else if (e.key === "Escape") {
+                      setTagSuggestionsOpen(false);
+                      setHighlightedTagIndex(-1);
+                    } else if (e.key === "Tab") {
+                      setTagSuggestionsOpen(false);
+                      setHighlightedTagIndex(-1);
+                    } else if ((e.key === "Enter" || e.key === "," || e.key === " ") && tagInput.trim()) {
                       e.preventDefault();
                       const t = tagInput.trim().replace(/,$/, "");
                       if (t && !addTags.includes(t)) setAddTags((prev) => [...prev, t]);
@@ -746,23 +844,34 @@ function App() {
               </div>
               {tagSuggestionsOpen && (() => {
                 const q = tagInput.toLowerCase();
-                const suggestions = userTags
+                const recentMatches = recentTags
                   .filter((t) => !addTags.includes(t) && (!q || t.toLowerCase().startsWith(q)))
-                  .slice(0, 6);
-                if (suggestions.length === 0) return null;
+                  .slice(0, 3);
+                const otherSuggestions = userTags
+                  .filter((t) => !addTags.includes(t) && !recentMatches.includes(t) && (!q || t.toLowerCase().startsWith(q)))
+                  .slice(0, Math.max(0, 6 - recentMatches.length));
+                const allSuggestions = [...recentMatches, ...otherSuggestions];
+                if (allSuggestions.length === 0) return null;
                 return (
                   <div className="tag-suggestions">
-                    {suggestions.map((t) => (
+                    {allSuggestions.map((t, idx) => (
                       <button
                         key={t}
                         type="button"
-                        className="tag-suggestion"
+                        tabIndex={-1}
+                        className={`tag-suggestion${idx === highlightedTagIndex ? " highlighted" : ""}`}
                         onMouseDown={(e) => {
                           e.preventDefault();
                           setAddTags((prev) => [...prev, t]);
                           setTagInput("");
+                          setHighlightedTagIndex(-1);
                         }}
-                      >{t}</button>
+                      >
+                        {t}
+                        {recentMatches.includes(t) && (
+                          <img src="/history.svg" className="tag-suggestion-icon" aria-hidden="true" />
+                        )}
+                      </button>
                     ))}
                   </div>
                 );

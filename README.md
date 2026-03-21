@@ -45,3 +45,4 @@ npm run tauri dev
 - Pinboard v1 API (`posts/all`, `posts/add`, `posts/delete`, `tags/get`)
 - [Inter](https://rsms.me/inter/) — UI chrome and structural elements
 - [Space Mono](https://fonts.google.com/specimen/Space+Mono) — data, inputs, and instructional text
+- [Material Symbols](https://fonts.google.com/icons) by Google — history icon (Apache 2.0)
