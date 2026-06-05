@@ -1,3 +1,18 @@
+# Pinboarder v0.2.0
+
+## What's new
+
+### Bug fixes
+- **Tag dropdown arrow navigation** — ArrowDown now opens the dropdown if it was closed, and ArrowUp from the first item deselects back to the input (no longer stuck at index 0)
+- **Dock icon hidden on launch** — app no longer briefly appears in the macOS Dock when starting; `LSUIElement` is now set at the plist level
+
+### UX improvements
+- Recent tags surfaced first in tag suggestions (stored locally, max 3)
+- Keyboard navigation for the header options menu and bookmark row context menu (ArrowUp/Down, Escape to close and return focus)
+- Header options menu closes on blur (focus leaving the menu area)
+
+---
+
 # Pinboarder v0.1.0
 
 First public release.
