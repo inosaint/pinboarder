@@ -812,12 +812,13 @@ function App() {
                       .slice(0, Math.max(0, 6 - recentMatches.length));
                     const allSuggestions = [...recentMatches, ...otherSuggestions];
 
-                    if (e.key === "ArrowDown" && tagSuggestionsOpen && allSuggestions.length > 0) {
+                    if (e.key === "ArrowDown" && allSuggestions.length > 0) {
                       e.preventDefault();
-                      setHighlightedTagIndex((i) => Math.min(i + 1, allSuggestions.length - 1));
+                      setTagSuggestionsOpen(true);
+                      setHighlightedTagIndex((i) => Math.min(i < 0 ? 0 : i + 1, allSuggestions.length - 1));
                     } else if (e.key === "ArrowUp" && tagSuggestionsOpen && allSuggestions.length > 0) {
                       e.preventDefault();
-                      setHighlightedTagIndex((i) => Math.max(i - 1, 0));
+                      setHighlightedTagIndex((i) => (i <= 0 ? -1 : i - 1));
                     } else if (e.key === "Enter" && highlightedTagIndex >= 0 && allSuggestions[highlightedTagIndex]) {
                       e.preventDefault();
                       const t = allSuggestions[highlightedTagIndex];
