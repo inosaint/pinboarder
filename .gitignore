@@ -25,3 +25,10 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Secrets — never commit credentials
+.env
+.env.*
+*.pem
+*.p12
+*.key

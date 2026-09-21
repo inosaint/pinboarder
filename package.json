@@ -1,13 +1,16 @@
 {
   "name": "pinboarder",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "icon:compile": "sh scripts/compile-icon.sh",
+    "build:signed": "sh -c 'test -f .env.local || { echo \"Missing .env.local with APPLE_SIGNING_IDENTITY\" >&2; exit 1; }; set -a; . ./.env.local; set +a; tauri build'",
+    "build:release": "rustup target add x86_64-apple-darwin && APPLE_SIGNING_IDENTITY=- tauri build --target universal-apple-darwin"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

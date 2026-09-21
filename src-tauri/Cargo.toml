@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -32,3 +32,4 @@ uuid = { version = "1.10", features = ["v4"] }
 tokio = { version = "1.48", features = ["time", "sync"] }
 tauri-plugin-stronghold = "2"
 argon2 = { version = "0.5", features = ["password-hash"] }
+keyring = { version = "3", features = ["apple-native"] }

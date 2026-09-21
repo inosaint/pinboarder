@@ -26,6 +26,8 @@ pub struct SyncStatus {
     pub pending_count: i64,
     pub last_sync_epoch: Option<i64>,
     pub last_error: Option<String>,
+    /// auth | offline | rate_limited | server | error — drives UI messaging
+    pub last_error_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +106,7 @@ struct AddResult {
 #[derive(Debug, Serialize, Clone)]
 pub struct PageMeta {
     pub title: String,
+    pub description: String,
     pub tags: Vec<String>,
 }
 
@@ -236,6 +239,14 @@ impl PinboardCore {
             "#,
         )
         .map_err(to_string_err)?;
+        if conn.prepare("SELECT last_error_kind FROM sync_state LIMIT 1").is_err() {
+            conn.execute("ALTER TABLE sync_state ADD COLUMN last_error_kind TEXT", [])
+                .map_err(to_string_err)?;
+        }
+        // A write interrupted mid-send (crash, or network error in older versions)
+        // would otherwise never be retried.
+        conn.execute("UPDATE pending_writes SET status='queued' WHERE status='sending'", [])
+            .map_err(to_string_err)?;
         Ok(())
     }
 
@@ -249,6 +260,13 @@ impl PinboardCore {
         }
         sync_log("set_token cached");
         Ok(())
+    }
+
+    /// Drops the in-memory token without touching local data.
+    pub fn forget_token(&self) {
+        if let Ok(mut cache) = self.token_cache.lock() {
+            *cache = None;
+        }
     }
 
     pub fn has_token(&self) -> bool {
@@ -278,7 +296,8 @@ impl PinboardCore {
                  next_generic_at=0,
                  next_recent_at=0,
                  backoff_seconds=0,
-                 last_error=NULL
+                 last_error=NULL,
+                 last_error_kind=NULL
              WHERE id=1",
             [],
         )
@@ -382,6 +401,7 @@ impl PinboardCore {
                 pending_count: 0,
                 last_sync_epoch: None,
                 last_error: None,
+                last_error_kind: None,
             });
         }
         let conn = self.conn()?;
@@ -392,17 +412,18 @@ impl PinboardCore {
                 |row| row.get(0),
             )
             .map_err(to_string_err)?;
-        let (last_sync_epoch, last_error): (Option<i64>, Option<String>) = conn
+        let (last_sync_epoch, last_error, last_error_kind): (Option<i64>, Option<String>, Option<String>) = conn
             .query_row(
-                "SELECT last_sync_epoch, last_error FROM sync_state WHERE id = 1",
+                "SELECT last_sync_epoch, last_error, last_error_kind FROM sync_state WHERE id = 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .map_err(to_string_err)?;
         Ok(SyncStatus {
             pending_count,
             last_sync_epoch,
             last_error,
+            last_error_kind,
         })
     }
 
@@ -413,7 +434,7 @@ impl PinboardCore {
         let conn = self.conn()?;
         conn.execute(
             "UPDATE sync_state
-             SET last_sync_epoch=?1, last_error=NULL
+             SET last_sync_epoch=?1, last_error=NULL, last_error_kind=NULL
              WHERE id=1",
             params![now_epoch()],
         )
@@ -516,10 +537,9 @@ impl PinboardCore {
             .timeout(std::time::Duration::from_secs(8))
             .send()
             .await
-            .map_err(to_string_err)?
-            .text()
-            .await
-            .map_err(to_string_err)?;
+            .map_err(|e| self.network_failure(e))?;
+        self.check_status(response.status())?;
+        let response = response.text().await.map_err(redact)?;
         // Response is {"tag": count, ...}
         let map: std::collections::HashMap<String, serde_json::Value> =
             serde_json::from_str(&response).map_err(to_string_err)?;
@@ -543,9 +563,9 @@ impl PinboardCore {
             .query(&[("auth_token", token.as_str()), ("url", href), ("format", "json")])
             .send()
             .await
-            .map_err(to_string_err)?;
-        if !response.status().is_success() && response.status() != StatusCode::NOT_FOUND {
-            return Err(format!("Pinboard API error: {}", response.status()));
+            .map_err(|e| self.network_failure(e))?;
+        if response.status() != StatusCode::NOT_FOUND {
+            self.check_status(response.status())?;
         }
         // Remove from local DB regardless of API result (may not exist remotely for local-only items)
         let href_norm = normalize_url(href)?;
@@ -568,14 +588,15 @@ impl PinboardCore {
             ])
             .send()
             .await
-            .map_err(to_string_err)?;
+            .map_err(|e| self.network_failure(e))?;
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             self.apply_backoff(60)?;
             sync_log("check_update rate limited (429)");
             return Err("Rate limited by Pinboard API".to_string());
         }
+        self.check_status(response.status())?;
         sync_log(&format!("check_update http status={}", response.status()));
-        let value: serde_json::Value = response.json().await.map_err(to_string_err)?;
+        let value: serde_json::Value = response.json().await.map_err(redact)?;
         let parsed: Result<UpdateResponse, _> = serde_json::from_value(value.clone());
         let update_time = parsed
             .ok()
@@ -616,15 +637,16 @@ impl PinboardCore {
             .query(&[("auth_token", token.as_str()), ("format", "json")])
             .send()
             .await
-            .map_err(to_string_err)?;
+            .map_err(|e| self.network_failure(e))?;
 
         if response.status() == StatusCode::TOO_MANY_REQUESTS {
             self.apply_backoff(60)?;
             sync_log("pull_recent rate limited (429)");
             return Err("Rate limited by Pinboard API".to_string());
         }
+        self.check_status(response.status())?;
         sync_log(&format!("pull_recent http status={}", response.status()));
-        let body = response.text().await.map_err(to_string_err)?;
+        let body = response.text().await.map_err(redact)?;
         sync_log(&format!("pull_recent body bytes={}", body.len()));
         let posts: Vec<RecentPost> = if let Ok(list) = serde_json::from_str::<Vec<RecentPost>>(&body) {
             list
@@ -672,7 +694,7 @@ impl PinboardCore {
         }
         tx.execute(
             "UPDATE sync_state
-             SET last_sync_epoch=?1, last_error=NULL
+             SET last_sync_epoch=?1, last_error=NULL, last_error_kind=NULL
              WHERE id=1",
             params![now_epoch()],
         )
@@ -729,13 +751,26 @@ impl PinboardCore {
                     ("replace", "yes"),
                 ])
                 .send()
-                .await
-                .map_err(to_string_err)?;
+                .await;
+            let response = match response {
+                Ok(r) => r,
+                Err(e) => {
+                    // Offline: keep the write queued without burning a retry attempt
+                    self.requeue(&item.id)?;
+                    return Err(self.network_failure(e));
+                }
+            };
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 self.mark_retry(&item.id, "429 rate limited")?;
                 self.apply_backoff(3)?;
                 sync_log(&format!("flush_pending_writes id={} rate limited", item.id));
                 continue;
+            }
+            let status = response.status();
+            if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) || status.is_server_error() {
+                // Not this bookmark's fault — keep it queued until Pinboard accepts writes again
+                self.requeue(&item.id)?;
+                self.check_status(status)?;
             }
             sync_log(&format!(
                 "flush_pending_writes id={} http status={}",
@@ -743,7 +778,7 @@ impl PinboardCore {
                 response.status()
             ));
 
-            let parsed: Result<AddResult, _> = response.json().await.map_err(to_string_err);
+            let parsed: Result<AddResult, _> = response.json().await.map_err(redact);
             match parsed {
                 Ok(result) if result.result_code.as_deref() == Some("done") => {
                     self.mark_write_success(&item.id)?;
@@ -895,12 +930,54 @@ impl PinboardCore {
             "UPDATE sync_state
              SET next_generic_at=?1,
                  next_recent_at=CASE WHEN ?3 = 1 THEN ?2 ELSE next_recent_at END,
-                 backoff_seconds=0
+                 backoff_seconds=0,
+                 last_error=NULL,
+                 last_error_kind=NULL
              WHERE id=1",
             params![next_generic_at, next_recent_at, if recent_endpoint { 1 } else { 0 }],
         )
         .map_err(to_string_err)?;
         Ok(())
+    }
+
+    fn requeue(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn()?;
+        conn.execute("UPDATE pending_writes SET status='queued' WHERE id=?1", params![id])
+            .map_err(to_string_err)?;
+        Ok(())
+    }
+
+    fn record_error(&self, kind: &str, message: &str) {
+        let result = self.conn().and_then(|conn| {
+            conn.execute(
+                "UPDATE sync_state SET last_error=?1, last_error_kind=?2 WHERE id=1",
+                params![message, kind],
+            )
+            .map_err(to_string_err)
+        });
+        if let Err(e) = result {
+            sync_log(&format!("record_error failed: {}", e));
+        }
+    }
+
+    /// For a request that never got a response. Records it for the UI and
+    /// returns a message with the URL (and so the token) stripped out.
+    fn network_failure(&self, err: reqwest::Error) -> String {
+        sync_log(&format!("pinboard network error: {}", redact(err)));
+        let message = "Can't reach Pinboard. New links are saved and will sync when you're back online.";
+        self.record_error("offline", message);
+        message.to_string()
+    }
+
+    /// Records and returns an error for a non-success Pinboard response.
+    /// 429 is handled separately by callers (it needs backoff).
+    fn check_status(&self, status: StatusCode) -> Result<(), String> {
+        if status.is_success() {
+            return Ok(());
+        }
+        let (kind, message) = classify_pinboard_status(status);
+        self.record_error(kind, &message);
+        Err(message)
     }
 
     fn apply_backoff(&self, baseline: i64) -> Result<(), String> {
@@ -912,7 +989,8 @@ impl PinboardCore {
         conn.execute(
             "UPDATE sync_state
              SET backoff_seconds=?1,
-                 last_error='Rate limited by Pinboard API'
+                 last_error='Pinboard is rate limiting requests. Retrying shortly.',
+                 last_error_kind='rate_limited'
              WHERE id=1",
             params![next],
         )
@@ -940,6 +1018,7 @@ impl PinboardCore {
         if is_blocked_host(host) {
             return Err("Refusing local/private host for metadata fetch".to_string());
         }
+        let started = std::time::Instant::now();
         let html = self.client
             .get(parsed)
             .timeout(std::time::Duration::from_secs(5))
@@ -952,7 +1031,12 @@ impl PinboardCore {
 
         let title = extract_title(&html);
         let tags = extract_tags(&html);
-        Ok(PageMeta { title, tags })
+        let description = meta_content(&html, "name", "description")
+            .or_else(|| meta_content(&html, "property", "og:description"))
+            .map(|d| d.trim().chars().take(500).collect())
+            .unwrap_or_default();
+        sync_log(&format!("fetch_page_meta took={}ms", started.elapsed().as_millis()));
+        Ok(PageMeta { title, description, tags })
     }
 
     fn conn(&self) -> Result<Connection, String> {
@@ -999,6 +1083,28 @@ fn sync_log(message: &str) {
 
 fn now_epoch() -> i64 {
     Utc::now().timestamp()
+}
+
+/// reqwest error text includes the request URL, which carries `auth_token`.
+/// Every Pinboard request error must go through this before it's logged or returned.
+fn redact(err: reqwest::Error) -> String {
+    err.without_url().to_string()
+}
+
+fn classify_pinboard_status(status: StatusCode) -> (&'static str, String) {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => (
+            "auth",
+            "Pinboard rejected your API token. If your subscription has lapsed, renew it at pinboard.in. \
+             If you changed your token, reset it from the ••• menu."
+                .to_string(),
+        ),
+        s if s.is_server_error() => (
+            "server",
+            format!("Pinboard is having problems ({}). Will retry automatically.", s.as_u16()),
+        ),
+        s => ("error", format!("Pinboard returned an error ({}).", s.as_u16())),
+    }
 }
 
 fn to_string_err<E: std::fmt::Display>(err: E) -> String {
@@ -1078,6 +1184,14 @@ mod tests {
         assert_eq!(retry_delay_seconds(1), 6);
         assert_eq!(retry_delay_seconds(5), 96);
         assert_eq!(retry_delay_seconds(8), 96);
+    }
+
+    #[test]
+    fn classifies_pinboard_statuses() {
+        assert_eq!(classify_pinboard_status(StatusCode::UNAUTHORIZED).0, "auth");
+        assert_eq!(classify_pinboard_status(StatusCode::FORBIDDEN).0, "auth");
+        assert_eq!(classify_pinboard_status(StatusCode::SERVICE_UNAVAILABLE).0, "server");
+        assert_eq!(classify_pinboard_status(StatusCode::BAD_REQUEST).0, "error");
     }
 
     #[test]
