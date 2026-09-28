@@ -1,3 +1,39 @@
+# Pinboarder v0.3.0
+
+## What's new
+
+### Jev tag suggestions (optional)
+- Add a [TypeSafe](https://docs.typesafe.ai) API key from the ••• menu and Jev picks tags from your own Pinboard library for each new link
+- Works from the page's URL, title, description and keywords; falls back to page keywords when Jev is unavailable
+- Key is verified before it's saved, and stored in the macOS Keychain — never in the app's web layer
+- Clear messages for a rejected key, a used-up usage limit or rate limiting; the app keeps working offline without Jev
+
+### Security
+- **Pinboard token moved to the macOS Keychain** — replaces the Stronghold vault, whose password shipped inside the app. Existing tokens migrate automatically on first launch
+- **Token no longer leaks into error messages** — failed Pinboard requests had the full request URL, including `auth_token`, in their error text, which reached logs, the local database and the UI
+
+### Pinboard sync status
+- Clear messages for a rejected token or lapsed subscription, being offline, Pinboard outages and rate limiting, with a matching sync badge
+- Links added while offline are kept and retried instead of failing permanently, and no longer get stuck mid-send
+
+### Tags and forms
+- Enter now adds the highlighted tag suggestion, which is the top match while you type
+- Focus returns to the URL field after saving, instead of staying in the tag field
+- Menu items in the ••• menus now respond to the first click
+- Pasted URLs fetch the page immediately, without the 0.7s pause used for typing
+
+### Appearance
+- New app icon, built with Icon Composer: adapts to Default, Dark, Tinted and Clear appearance modes on macOS 26
+- The panel pops out of the menu bar nub each time it opens, and respects Reduce Motion
+- Removed the stray outline around the panel (the native window shadow)
+
+### Build
+- `npm run build:signed` — local signed build; reads your certificate name from `.env.local`
+- `npm run build:release` — ad-hoc signed universal `.dmg` (Apple Silicon + Intel) for releases
+- `npm run icon:compile` — regenerates icon files from `src-tauri/icons/Pinboarder.icon`
+
+---
+
 # Pinboarder v0.2.0
 
 ## What's new

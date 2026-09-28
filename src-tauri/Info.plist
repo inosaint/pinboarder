@@ -4,5 +4,8 @@
 <dict>
   <key>LSUIElement</key>
   <true/>
+  <!-- Liquid Glass icon from Assets.car (macOS 26+); older macOS falls back to icon.icns -->
+  <key>CFBundleIconName</key>
+  <string>Pinboarder</string>
 </dict>
 </plist>

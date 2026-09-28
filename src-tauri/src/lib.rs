@@ -1,6 +1,9 @@
 mod core;
+mod jev;
+mod secrets;
 
 use crate::core::{Bookmark, BookmarkPage, PageMeta, PinboardCore, SyncStatus};
+use crate::jev::{JevClient, JevFailure, PageContext};
 use std::sync::{Arc, Mutex};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -12,13 +15,40 @@ use tauri::{
 #[derive(Clone)]
 struct SharedState {
     core: Arc<PinboardCore>,
+    jev: Arc<JevClient>,
     last_shown_at: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+/// Runs a blocking closure (keychain access) off the async runtime.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(to_string_err)?
 }
 
 #[tauri::command]
 async fn set_api_token(state: tauri::State<'_, SharedState>, token: String) -> Result<(), String> {
-    state.core.set_token(token.trim())?;
+    let token = token.trim().to_string();
+    state.core.set_token(&token)?;
+    if let Err(e) = blocking(move || secrets::write(secrets::PINBOARD_SERVICE, &token)).await {
+        state.core.forget_token();
+        return Err(e);
+    }
     Ok(())
+}
+
+/// Loads the Pinboard token from the keychain into memory. Returns whether one was found.
+#[tauri::command]
+async fn restore_api_token(state: tauri::State<'_, SharedState>) -> Result<bool, String> {
+    match blocking(|| secrets::read(secrets::PINBOARD_SERVICE)).await? {
+        Some(token) => {
+            state.core.set_token(&token)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
 }
 
 #[tauri::command]
@@ -55,7 +85,11 @@ async fn quick_add_bookmark(
         return Err("API token missing. Set your token first.".to_string());
     }
     state.core.queue_add(url.trim(), title.trim(), tags.trim())?;
-    state.core.flush_pending_writes().await?;
+    // The bookmark is queued locally; if sending fails (offline, Pinboard down)
+    // it's recorded in sync status and retried by the sync loop.
+    if let Err(err) = state.core.flush_pending_writes().await {
+        app_sync_log(&format!("quick_add flush deferred: {}", err));
+    }
     Ok(())
 }
 
@@ -96,7 +130,53 @@ async fn has_api_token(state: tauri::State<'_, SharedState>) -> Result<bool, Str
 
 #[tauri::command]
 async fn clear_api_token(state: tauri::State<'_, SharedState>) -> Result<(), String> {
+    blocking(|| secrets::delete(secrets::PINBOARD_SERVICE)).await?;
     state.core.clear_token()
+}
+
+#[tauri::command]
+async fn has_jev_key(state: tauri::State<'_, SharedState>) -> Result<bool, String> {
+    let jev = state.jev.clone();
+    Ok(blocking(move || jev.key()).await?.is_some())
+}
+
+#[tauri::command]
+async fn set_jev_key(state: tauri::State<'_, SharedState>, key: String) -> Result<(), JevFailure> {
+    state.jev.set_key(&key).await
+}
+
+#[tauri::command]
+async fn clear_jev_key(state: tauri::State<'_, SharedState>) -> Result<(), String> {
+    let jev = state.jev.clone();
+    blocking(move || jev.clear_key()).await
+}
+
+/// Handshake with TypeSafe: confirms the key works and usage remains.
+#[tauri::command]
+async fn check_jev(state: tauri::State<'_, SharedState>) -> Result<(), JevFailure> {
+    let jev = state.jev.clone();
+    blocking(move || jev.key()).await?;
+    state.jev.check().await
+}
+
+#[tauri::command]
+async fn suggest_tags(
+    state: tauri::State<'_, SharedState>,
+    url: String,
+    title: String,
+    description: String,
+    page_keywords: Vec<String>,
+    candidates: Vec<String>,
+) -> Result<Vec<String>, JevFailure> {
+    let jev = state.jev.clone();
+    blocking(move || jev.key()).await?;
+    let page = PageContext {
+        url: &url,
+        title: &title,
+        description: &description,
+        page_keywords: &page_keywords,
+    };
+    state.jev.suggest_tags(page, &candidates).await
 }
 
 fn build_tray_menu(app: &tauri::AppHandle, _recent: &[Bookmark]) -> Result<tauri::menu::Menu<Wry>, String> {
@@ -142,6 +222,7 @@ fn toggle_panel_at_tray(app: &AppHandle, rect: Rect, state: &SharedState) {
         let is_visible = window.is_visible().unwrap_or(false);
         if is_visible {
             let _ = window.hide();
+            let _ = window.emit("panel-hidden", ());
             return;
         }
 
@@ -180,6 +261,8 @@ fn toggle_panel_at_tray(app: &AppHandle, rect: Rect, state: &SharedState) {
 
         let _ = window.show();
         let _ = window.set_focus();
+        // Lets the frontend replay its open animation (the webview isn't remounted)
+        let _ = window.emit("panel-shown", ());
     }
 }
 
@@ -239,6 +322,7 @@ pub fn run() {
                         .unwrap_or(true);
                     if should_hide {
                         let _ = window.hide();
+                        let _ = window.emit("panel-hidden", ());
                     }
                 }
             }
@@ -252,8 +336,14 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(to_string_err)?;
             let core = Arc::new(PinboardCore::new(&app_data_dir)?);
+            let jev_http = reqwest::Client::builder()
+                .user_agent(concat!("pinboarder/", env!("CARGO_PKG_VERSION")))
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .map_err(to_string_err)?;
             let shared = SharedState {
                 core,
+                jev: Arc::new(JevClient::new(jev_http)),
                 last_shown_at: Arc::new(Mutex::new(None)),
             };
             app.manage(shared.clone());
@@ -312,7 +402,13 @@ pub fn run() {
             get_user_tags,
             sync_now,
             get_sync_status,
-            has_api_token
+            has_api_token,
+            restore_api_token,
+            has_jev_key,
+            set_jev_key,
+            clear_jev_key,
+            check_jev,
+            suggest_tags
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
